@@ -6,7 +6,16 @@ from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("nmap-mcp-server",json_response=True)
 
-@mcp.tool()
+@mcp.tool(
+    title="Nmap TCP Port Scan",
+    description=(
+        "Run an Nmap TCP connect scan against a single target. "
+        "Use this tool during reconnaissance to check whether specific TCP ports are open. "
+        "Input target should be a hostname or IP address. "
+        "Input ports should be a comma-separated port list such as '22,80,443'. "
+        "Returns the executed command, exit status, stdout, and stderr."
+    ),
+)
 def run_nmap_tcp_scan(
     target:str,#target:str 扫描目标
     ports:str="80,443,8080",#扫描端口
@@ -15,7 +24,7 @@ def run_nmap_tcp_scan(
     nmap_path = shutil.which("nmap") #寻找nmap可执行位置
     if not nmap_path:#nmap命令的实际路径
         raise RuntimeError("nmap is not installed or present" 
-        "in PATH")
+" in PATH")
     command = [ #最终要执行的命令参数列表
         nmap_path,
         "-sT",
