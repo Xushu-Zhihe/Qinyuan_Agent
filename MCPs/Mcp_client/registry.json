@@ -1,0 +1,18 @@
+{
+    "mcpServers":{
+        "nmap":{
+            "command":"uv",
+            "args":[
+                "--directory",
+                "/home/autyui/桌面/Agent/Qinyuan_Agent/MCPs/Nmap_Mcp",
+                "run",
+                "server.py"
+            ],
+            "env":{
+                "MCP_NMAP_ALLOWED_TARGETS":"127.0.0.1,192.168.56.0/24"
+            },
+            "tags":["recon"],
+            "enabled":true
+        }
+    }
+}
