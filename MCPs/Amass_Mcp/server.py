@@ -9,11 +9,10 @@ mcp =FastMCP("amass-mcp-server",json_response=True)
 @mcp.tool(
     title="Check Amass",
     description=(
-        "Check whether amass is installed and available in PATH."
+        "Check whether amass is installed and available in PATH. "
         "Returns the executable path and version output."
     ),
 )
-
 def check_amass()->dict[str,Any]:
     amass_path=shutil.which("amass")
 
@@ -51,7 +50,6 @@ def check_amass()->dict[str,Any]:
         "Passive mode mainly uses public data sources and does not actively probe the target."
     ),
 )
-
 def run_amass_passive_scan(
     domain:str,
     timeout_seconds:int=180,
@@ -106,7 +104,7 @@ def run_amass_passive_scan(
         "command": command,
     }
 
-mcp.tool(
+@mcp.tool(
     title="Amass Domain Scan",
     description=(
         "Run amass enumeration against a single domain. "
@@ -115,7 +113,6 @@ mcp.tool(
         "This may perform a broader enumeration than passive mode."
     ),
 )
-
 def run_amass_scan(
         domain:str,
         timeout_seconds:int=300,
@@ -177,7 +174,6 @@ def run_amass_scan(
         "For safety, this tool scans each domain in passive mode by default."
     ),
 )
-
 def run_amass_batch_scan(
     domains: list[str],
     timeout_seconds: int = 180,
