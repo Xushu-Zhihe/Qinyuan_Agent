@@ -1,0 +1,13 @@
+{
+    "mcpServers": {
+        "subfinder-demo": {
+            "command": "uv",
+            "args": [
+                "--directory",
+                "C:\\Users\\lenovo\\Desktop\\agent\\Qinyuan_Agent\\MCPs\\Subfinder_Mcp",
+                "run",
+                "server.py"
+            ]
+        }
+    }
+}
