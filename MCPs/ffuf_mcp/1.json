@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "ffuf-mcp": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "你的 ffuf-mcp 目录",
+        "run",
+        "server.py"
+      ]
+    }
+  }
+}
