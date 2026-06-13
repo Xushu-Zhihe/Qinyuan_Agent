@@ -1,0 +1,13 @@
+{
+    "mcpServers":{
+        "httpx-demo":{
+            "command":"uv",
+            "args":[
+                "--directory",
+                "/path/to/Qinyuan_Agent/MCPs/Httpx_Mcp",
+                "run",
+                "server.py"
+            ]
+        }
+    }
+}
