@@ -1,0 +1,13 @@
+{
+    "mcpServers":{
+        "nmap-demo":{
+            "command":"uv",
+            "args":[
+                "--directory",
+                "/home/autyui/桌面/Agent/Mcp/MCPS/Mcp_Qxl",
+                "run",
+                "server.py"
+            ]
+        }
+    }
+}
