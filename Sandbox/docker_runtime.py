@@ -27,7 +27,7 @@ class DockerRuntime:
         except Exception as error:
             raise DockerRuntimeError(
                 "Cannot connect to DOcker."
-            )from error
+            ) from error
 
         self._ensure_internal_network()
 
@@ -50,11 +50,13 @@ class DockerRuntime:
                 tmpfs={
                     "/tmp":(
                         "rw,noexec,nosuid,nodev,"
-                        f"size={self.settings.temporary_size}"
+                        f"size={self.settings.temporary_size},"
+                        "mode=1777"
                     ),
                     "/workspace":(
                         "rw,noexec,nosuid,nodev,"
-                        f"size={self.settings.workspace_size}"
+                        f"size={self.settings.workspace_size},"
+                        "uid=10001,gid=10001,mode=0700"
                     ),
                 },
             cap_drop=["ALL"],
@@ -74,12 +76,12 @@ class DockerRuntime:
 
             container.reload()
 
-            if container.stats != "running":
+            if container.status != "running":
                 logs = container.logs(
                     stdout=True,
                     stderr=True,
                     tail=100,
-                ).encode("utf-8",errors="replace")
+                ).decode("utf-8",errors="replace")
 
                 self.destroy(container.id)
 
@@ -115,8 +117,8 @@ class DockerRuntime:
         command = [
             "timeout",
             "--signal=KILL",
-            "--kill-afrer=5s",
-            f"{request.tiemout_seconds}s",
+            "--kill-after=5s",
+            f"{request.timeout_seconds}s",
             *request.argv,
         ]
 
@@ -212,42 +214,35 @@ class DockerRuntime:
         except NotFound:
             try:
                 network = self.client.networks.create(
-                    self.settings.network    
+                    name=self.settings.network,
+                    driver="bridge",
+                    internal=True,
+                    check_duplicate=True,
+                    labels={
+                        "qinyuan.managed":"true",
+                        "qinyuan.component":"sandbox-network",
+                    },
                 )
 
-            except NotFound:
-                try:
-                    network = self.client.networks.create(
-                        name=self.settings.network,
-                        driver="bridge",
 
-                        internal=True,
+            except APIError as error:
+                if error.status_code != 409:
+                    raise DockerRuntimeError(
+                        "Failed to create sandbox network:"
+                        f"{error.explanation}"
+                    ) from error
 
-                        check_duplicate=True,
-
-                        labels={
-                            "qinyuan.managed":"true",
-                            "qinyuan.component":"sandbox-network",
-                        },
-                    )
-                except APIError as error:
-                    if error.status_code != 409:
-                        raise DockerRuntimeError(
-                            "Failed to create sandbox network:"
-                            f"{error.explanation}"
-                        ) from error
-
-                    network = self.client.networks.get(
-                        self.settings.network
-                    )
-
-            network.reload()
-
-            if not network.attrs.get("Internal",False):
-                raise DockerRuntimeError(
-                    f"Docker network {self.settings.network!r} exists"
-                    "but is not configured as an internal network"
+                network = self.client.networks.get(
+                    self.settings.network
                 )
+
+        network.reload()
+
+        if not network.attrs.get("Internal",False):
+            raise DockerRuntimeError(
+                f"Docker network {self.settings.network!r} exists"
+                "but is not configured as an internal network"
+            )
 
     def _ensure_image_exists(self) -> None:
         """
@@ -297,7 +292,7 @@ class DockerRuntime:
         """
 
         normalized = re.sub(
-            r"[^a-zA-Z0-9._]",
+            r"[^a-zA-Z0-9_.-]",
             "-",
             agent_id,
         ).strip(".-")

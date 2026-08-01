@@ -18,8 +18,8 @@ class SandboxSession:
 @dataclass(frozen=True)
 class CommandRequest:
     tool: str
-    arguments: tuple[str,...]
-    tiemout_seconds: int = 30
+    arguments: tuple[str,...] = ()
+    timeout_seconds: int = 30
 
     @property
     def argv(self) -> list[str]:

@@ -1,8 +1,8 @@
-from dataclasses import dataclass
+from dataclasses import dataclass,field
 
 @dataclass(frozen=True)
 class SandboxSettings:
-    image: str = "qinyuan/pretest-sandbox:dev"
+    image: str = "qinyuan/pentest-sandbox:dev"
     network: str = "qinyuan_pentest_lab"
     
     memory_limit: str = "512m"
@@ -11,11 +11,11 @@ class SandboxSettings:
     process_limit: int = 128
 
     workspace_size: str = "128m"
-    temporary: str = "64m"
+    temporary_size: str = "64m"
 
-    maximun_timeout_seconds: int = 300
+    maximum_timeout_seconds: int = 300
 
-    allowed_tools: frozenset[set] = field(
+    allowed_tools: frozenset[str] = field(
         default_factory = lambda: frozenset(
             {
                 "nmap",

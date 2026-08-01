@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pathlib import path
+from pathlib import Path
 from threading import RLock
 
 from Sandbox.contracts import SandboxRuntime
@@ -37,8 +37,11 @@ class SandboxService:
         self.runtime = runtime
         self.settings = settings or SandboxSettings()
 
-        self._sessions = dict[str,SandboxSession] = {}
-        self._lock = RLock()
+        self._sessions: dict[str,SandboxSession] = {}     
+        self._agent_locks: dict[str, RLock] = {}
+
+        self._registry_lock = RLock()
+        self._closed = False
 
     def start_for_agent(self,agent_id: str) -> SandboxSession:
         agent_id = agent_id.strip()
@@ -46,8 +49,11 @@ class SandboxService:
         if not agent_id:
             raise SandboxError("agent_id connot be empty")
 
-        with self._lock:
-            existing_session = self._session.get(agent_id)
+        with self._registry_lock:
+            if self._closed:
+                raise SandboxError("SandboxService is closed")
+
+            existing_session = self._sessions.get(agent_id)
 
             if(
                 existing_session is not None
@@ -64,6 +70,8 @@ class SandboxService:
             )
 
             self._sessions[agent_id] = session
+            self._agent_locks[agent_id] = RLock()
+
             return session
 
     def execute(
@@ -73,46 +81,86 @@ class SandboxService:
     ) -> CommandResult:
         self._validate_command(request)
 
-        with self._lock:
+        with self._registry_lock:
             session = self._sessions.get(agent_id)
+            agent_lock = self._agent_locks.get(agent_id)
 
-        if session is None:
+        if session is None or agent_lock is None:
             raise SandboxNotFoundError(
                 f"Agent {agent_id!r} does not have a sandbox"
             )
 
-        return self.runtime.execute(
-            sandbox_id=session.sandbox_id,
-            request=request,
-        )
+        with agent_lock:
+            with self._registry_lock:
+                current_session = self._sessions.get(agent_id)
+
+            if(
+                current_session is None
+                or current_session.sandbox_id != session.sandbox_id
+            ):
+                raise SandboxNotFoundError(
+                    f"Sandbox for agent {agent_id!r} was removed"
+                )
+
+            if current_session.status != SandboxStatus.RUNNING:
+                raise SandboxError(
+                    f"Sandbox {current_session.sandbox_id!r}"
+                    "is not running"
+                )
+            
+            return self.runtime.execute(
+                sandbox_id=session.sandbox_id,
+                request=request,
+            )
 
     def stop_for_agent(self,agent_id: str) -> None:
-        with self._lock:
-            session = self._sessions.pop(agent_id,None)
+        with self._registry_lock:
+            agent_lock = self._agent_locks.get(agent_id)
 
-        if session is not None:
-            self.runtime.destory(session.sandbox_id)
+        if agent_lock is None:
+            return 
+
+        with agent_lock:
+            with self._registry_lock:
+                session = self._sessions.pop(agent_id,None)
+                self._agent_locks.pop(agent_id,None)
+
+            if session is not None:
+                self.runtime.destroy(session.sandbox_id)
 
     def get_session(self,agent_id: str) -> SandboxSession | None :
-        with self._lock:
+        with self._registry_lock:
             return self._sessions.get(agent_id)
 
     def stop_all(self) -> None:
-        with self._lock:
-            sessions = tuple(self._sessions.values())
-            self._sessions.clear()
+        with self._registry_lock:
+            agent_ids = tuple(self._sessions.keys())
 
-        for session in sessions:
-            self.runtiem.destory(session.sandbox_id)
+        for agent_id in agent_ids:
+            self.stop_for_agent(agent_id)
 
     def close(self) -> None:
+        with self._registry_lock:
+            if self._closed:
+                return
+
+            self._closed = True
+
         self.stop_all()
         self.runtime.close()
 
-    def _validate_command(self,request: CommandResult) -> None:
-        tool_name = Path(request.tool).name
+    def _validate_command(self,request: CommandRequest) -> None:
 
-        if tool_name != request.tool:
+        tool_name = request.tool.strip()
+
+        if not tool_name:
+            raise SandboxPolicyError("Tool cannot be empty")
+
+        if(
+            Path(tool_name).name != tool_name
+            or "/" in tool_name
+            or "\\" in tool_name
+        ):
             raise SandboxPolicyError(
                 "Tool must be a command name, not a filesystem path"
             )
@@ -122,16 +170,27 @@ class SandboxService:
                 f"Tool {tool_name!r} is not allowed"
             )
 
-        if not(
+        if not (
             1
-            <= request.timeout_seconds
-            <= self.settings.maximun_timeout_seconds
+            <=request.timeout_seconds
+            <=self.settings.maximum_timeout_seconds
         ):
             raise SandboxPolicyError(
                 "Command timeout is outside the allowed range"
             )
 
-        if any("\x00" in argument for argument in request.arguments):
+        if any(
+            not isinstance(argument,str)
+            for argument in request.arguments
+        ):
+            raise SandboxPolicyError(
+                "Every command argument must be a string"
+            )
+
+        if any(
+            "\x00" in argument
+            for argument in request.arguments
+        ):
             raise SandboxPolicyError(
                 "Command arguments cannot contain null bytes"
             )
