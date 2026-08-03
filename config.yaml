@@ -1,0 +1,48 @@
+model:
+  name: ""
+  base_url: ""
+  api_key_env: "OPENAI_API_KEY"
+
+# 对 Responses API 兼容层按真实能力显式配置。
+capabilities:
+  previous_response_id: true
+  prompt_cache_key: false
+  server_compaction: false
+  local_compaction: true
+  streaming: false
+  store: true
+
+runtime:
+  thread_id: "default"
+  state_dir: "var/threads"
+  soft_tool_rounds: 16
+  hard_tool_rounds: 64
+  repeated_call_limit: 3
+  turn_timeout_seconds: 600
+  model_timeout_seconds: 90
+  tool_timeout_seconds: 120
+  model_max_retries: 0
+  retry_initial_seconds: 0.5
+  interrupt_grace_seconds: 0.5
+  context_window: 128000
+  compact_ratio: 0.9
+  compaction_max_output_tokens: 2048
+  lease_ttl_seconds: 30
+  event_log_max_bytes: 10485760
+  event_log_backups: 3
+
+artifacts:
+  root: "var/artifacts"
+  memory_limit_bytes: 131072
+  preview_bytes: 16384
+  file_limit_bytes: 134217728
+  thread_limit_bytes: 1073741824
+  retention_days: 30
+  read_max_bytes: 262144
+
+powershell:
+  mode: "unrestricted"
+
+skills:
+  content_max_bytes: 262144
+  resource_max_bytes: 2097152

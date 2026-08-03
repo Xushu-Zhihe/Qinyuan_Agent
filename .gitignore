@@ -1,2 +1,5 @@
 .vscode
-.env
+/.codex-source/
+__pycache__/
+*.py[cod]
+/var/
