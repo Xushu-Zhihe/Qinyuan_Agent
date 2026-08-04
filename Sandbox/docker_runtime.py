@@ -20,8 +20,20 @@ class DockerRuntime:
         self.settings = settings or SandboxSettings()
 
         try:
-            self.client = docker.from_env()
-            self.client.ping()
+            self.client = docker.from_env(timeout=10)
+
+            version_info = self.client.version()
+
+            if not isinstance(version_info, dict):
+                raise DockerRuntimeError(
+                    "Docker returned an invalid version response"
+                )
+
+            if not version_info.get("ApiVersion"):
+                raise DockerRuntimeError(
+                    "Docker version response does not contain ApiVersion"
+                )
+            
         except DockerRuntimeError:
             raise
         except Exception as error:

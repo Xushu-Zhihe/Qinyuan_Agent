@@ -2,7 +2,7 @@ from dataclasses import dataclass,field
 
 @dataclass(frozen=True)
 class SandboxSettings:
-    image: str = "qinyuan/pentest-sandbox:dev"
+    image: str = "qinyuan/pentest-sandbox:0.1.0"
     network: str = "qinyuan_pentest_lab"
     
     memory_limit: str = "512m"

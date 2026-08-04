@@ -95,7 +95,7 @@ class MCPExecutionResult:
             "stdout":self.stdout,
             "stderr":self.stderr,
             "stdout_truncated":self.stdout_truncated,
-            "stderr_   ":self.stderr_truncated,
+            "stderr_truncated": self.stderr_truncated,
         }
 
 def load_registry(path: str | Path) -> MCPRegistryConfig:
