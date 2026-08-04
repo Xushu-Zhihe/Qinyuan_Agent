@@ -3,6 +3,11 @@
 from langchain.tools import tool
 import subprocess
 import re
+"""Host shell execution is disabled."""
+
+from Tools.execute_bash import create_sandbox_command_tool
+
+__all__ = ["create_sandbox_command_tool"]
 
 # 允许出现在管道中的只读命令
 ALLOWED_QUERY_COMMANDS = {
