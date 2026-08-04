@@ -1,6 +1,15 @@
-from .execute_bash import execute_bash
-from .query_shell import query_shell
+from .mcp_tools import (
+    NMAP_QUALIFIED_NAME,
+    NmapTCPScanInput,
+    create_agent_tool_registry,
+    create_agent_tools,
+    create_nmap_mcp_tool,
+)
 
-__all__ = ["execute_bash", "query_shell"]
-
-TOOLS=[execute_bash, query_shell]
+__all__ = [
+    "NMAP_QUALIFIED_NAME",
+    "NmapTCPScanInput",
+    "create_agent_tool_registry",
+    "create_agent_tools",
+    "create_nmap_mcp_tool",
+]

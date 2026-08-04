@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from mcp import ClientSession, StdioServerParameters, stdio_client
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client
 
 from Sandbox.models import CommandRequest
 from Sandbox.service import SandboxService
@@ -272,7 +272,7 @@ class MCPManager:
             else:
                 read_stream,write_stream,_ = (
                     await runtime.exit_stack.enter_async_context(
-                        streamablehttp_client(config.url or "")
+                        streamable_http_client(config.url or "")
                     )
                 )
 
