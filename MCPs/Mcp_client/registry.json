@@ -2,11 +2,9 @@
   "mcpServers": {
     "nmap": {
       "transport": "stdio",
-      "command": "uv",
+      "command": "{python}",
       "cwd": "../Nmap_Mcp",
       "args": [
-        "run",
-        "--frozen",
         "server.py"
       ],
       "env": {

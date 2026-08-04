@@ -26,7 +26,7 @@ class DockerRuntime:
             raise
         except Exception as error:
             raise DockerRuntimeError(
-                "Cannot connect to DOcker."
+                "Cannot connect to Docker."
             ) from error
 
         self._ensure_internal_network()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import asyncio
 import json
 import threading
@@ -23,7 +24,7 @@ class MCPServerNotReadyError(MCPClientError):
 class MCPCommandPlanError(MCPClientError):
     """MCP Server返回了非法的沙盒命令计划"""
 
-@dataclass(fronzen=True, slots=True)
+@dataclass(frozen=True, slots=True)
 class MCPServerConfig:
     """单个 MCP Server的启动和权限配置"""
 
@@ -134,7 +135,7 @@ def load_registry(path: str | Path) -> MCPRegistryConfig:
             isinstance(key,str) and isinstance(value,str)
             for key, value in env.items()
         ):
-            raise ValueError(f"{name!r}.enabled must be a boolean")
+            raise ValueError(f"{name!r}.env must be an object of strings")
 
         cwd: Path | None = None
         cwd_value = item.get("cwd")
@@ -150,7 +151,7 @@ def load_registry(path: str | Path) -> MCPRegistryConfig:
         if transport == "stdio":
             if not isinstance(command,str) or not command.strip():
                 raise ValueError(
-                    f"{name!r}.commmand is required for stdio transport"
+                    f"{name!r}.command is required for stdio transport"
                 )
         elif transport == "streamable_http":
             if not isinstance(url,str) or not url.strip():
@@ -217,7 +218,7 @@ class MCPManager:
         self.mcp_call_timeout_seconds = mcp_call_timeout_seconds
         self.output_character_limit = output_character_limit
 
-        self.runtime: dict[str, MCPServerRuntime] = {}
+        self.runtimes: dict[str, MCPServerRuntime] = {}
         self.tool_index: dict[str, MCPToolMeta] = {}
 
         self._event_loop: asyncio.AbstractEventLoop | None = None
@@ -257,8 +258,15 @@ class MCPManager:
                         f"MCP server cwd does not exist: {config.cwd}"
                     )
 
+                command = config.command or ""
+
+                # 使用当前正在运行 MCPManager 的 Python 解释器。
+                # 避免写死 .venv/Scripts/python.exe，也避免创建 MCP 独立 uv 环境。
+                if command == "{python}":
+                    command = sys.executable
+
                 parameters = StdioServerParameters(
-                    command=config.command or "",
+                    command=command,
                     args=list(config.args),
                     env=config.env,
                     cwd=config.cwd,
@@ -534,7 +542,7 @@ class MCPManager:
                 candidates.append(parsed)
 
         for candidate in candidates:
-            plan = candidates.get("sandbox_command")
+            plan = candidate.get("sandbox_command")
 
             # 兼容某些 MCP SDK将函数结果包装在 result字段中的情况
             if plan is None and isinstance(candidate.get("result"), dict):
