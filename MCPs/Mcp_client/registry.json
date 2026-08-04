@@ -1,31 +1,25 @@
 {
   "mcpServers": {
     "nmap": {
+      "transport": "stdio",
       "command": "uv",
+      "cwd": "../Nmap_Mcp",
       "args": [
-        "--directory",
-        "/home/autyui/桌面/Agent/Qinyuan_Agent/MCPs/Nmap_Mcp",
         "run",
+        "--frozen",
         "server.py"
       ],
       "env": {
-        "MCP_NMAP_ALLOWED_TARGETS": "127.0.0.1,localhost"
+        "MCP_NMAP_ALLOWED_TARGETS": "127.0.0.1,localhost,target-web",
+        "MCP_NMAP_MAX_PORTS": "1024"
       },
-      "tags": ["recon"],
-      "enabled": true
-    },
-    "burp": {
-      "command": "uv",
-      "args": [
-        "--directory",
-        "/home/autyui/桌面/Agent/Qinyuan_Agent/MCPs/Burp_Suite_Mcp",
-        "run",
-        "server.py"
+      "tags": [
+        "network-scan",
+        "reconnaissance"
       ],
-      "env": {
-        "MCP_BURP_ALLOWED_HOSTS": "127.0.0.1,localhost"
-      },
-      "tags": ["recon", "analyzer"],
+      "sandboxTools": [
+        "nmap"
+      ],
       "enabled": true
     }
   }
