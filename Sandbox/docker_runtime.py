@@ -15,14 +15,19 @@ class DockerRuntimeError(RuntimeError):
 class DockerRuntime:
     def __init__(
         self,
-        settings: SandboxSettings | None = None,    
+        settings: SandboxSettings | None = None,
     ) -> None:
         self.settings = settings or SandboxSettings()
 
-        try:
-            self.client = docker.from_env(timeout=10)
+        client = None
 
-            version_info = self.client.version()
+        try:
+            # 初始化阶段使用较短的超时。
+            client = docker.from_env(
+                timeout=self.settings.docker_connect_timeout_seconds
+            )
+
+            version_info = client.version()
 
             if not isinstance(version_info, dict):
                 raise DockerRuntimeError(
@@ -33,15 +38,31 @@ class DockerRuntime:
                 raise DockerRuntimeError(
                     "Docker version response does not contain ApiVersion"
                 )
-            
+
+            # 初始化完成后，将 API 超时调整为能够覆盖最长工具执行时间。
+            client.api.timeout = self.settings.docker_api_timeout_seconds
+
+            self.client = client
+            self._ensure_internal_network()
+
         except DockerRuntimeError:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
             raise
+
         except Exception as error:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
             raise DockerRuntimeError(
                 "Cannot connect to Docker."
             ) from error
-
-        self._ensure_internal_network()
 
     def create(self,agent_id: str) -> str:
         self._ensure_image_exists()
@@ -117,61 +138,117 @@ class DockerRuntime:
         request: CommandRequest,
     ) -> CommandResult:
         """
-        在指定容器中执行命令。
+        在指定 Agent 的容器中执行命令。
 
-        重要：
-        command是字符串列表，不经过 Shell
-        因此 arguments中的 &&、;、 |不会解释为 Shell操作符
+        安全性质：
+        1. 不调用 Shell。
+        2. 命令和参数使用 argv 列表。
+        3. 使用非 root 用户。
+        4. 使用 GNU timeout 限制执行时间。
+        5. 流式读取输出，防止超大输出占满宿主机内存。
         """
 
         container = self._get_running_container(sandbox_id)
 
         command = [
             "timeout",
-            "--signal=KILL",
+            "--signal=TERM",
             "--kill-after=5s",
             f"{request.timeout_seconds}s",
             *request.argv,
         ]
 
+        stdout_buffer = _BoundedByteBuffer(
+            self.settings.maximum_output_bytes_per_stream
+        )
+        stderr_buffer = _BoundedByteBuffer(
+            self.settings.maximum_output_bytes_per_stream
+        )
+
+        output_stream = None
+
         try:
-            execution = container.exec_run(
+            # 使用 Docker 低级 API，是为了流式读取 stdout/stderr。
+            execution = self.client.api.exec_create(
+                container=container.id,
                 cmd=command,
-
-                user="10001:10001",
-                workdir="/workspace",
-
                 stdout=True,
                 stderr=True,
-
                 stdin=False,
                 tty=False,
-
                 privileged=False,
+                user="10001:10001",
+                workdir="/workspace",
+            )
+
+            exec_id = execution.get("Id")
+            if not isinstance(exec_id, str) or not exec_id:
+                raise DockerRuntimeError(
+                    "Docker did not return a valid exec ID"
+                )
+
+            output_stream = self.client.api.exec_start(
+                exec_id=exec_id,
+                detach=False,
+                tty=False,
+                stream=True,
                 demux=True,
             )
+
+            for output in output_stream:
+                if isinstance(output, tuple):
+                    stdout_chunk, stderr_chunk = output
+                    stdout_buffer.append(stdout_chunk)
+                    stderr_buffer.append(stderr_chunk)
+
+                elif isinstance(output, bytes):
+                    # 理论上 demux=True 时应该返回 tuple。
+                    # 保留这个分支是为了兼容不同 Docker API 行为。
+                    stdout_buffer.append(output)
+
+            execution_info = self.client.api.exec_inspect(exec_id)
+            exit_code = execution_info.get("ExitCode")
+
+            if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+                raise DockerRuntimeError(
+                    "Docker did not return a valid exit code"
+                )
+
+        except DockerRuntimeError:
+            raise
+
         except APIError as error:
             raise DockerRuntimeError(
-                f"Failed to execute command in sandbox {sandbox_id!r}:"
+                f"Failed to execute command in sandbox {sandbox_id!r}: "
                 f"{error.explanation}"
             ) from error
 
-        stdout_bytes: bytes | None = None
-        stderr_bytes: bytes | None = None
+        except Exception as error:
+            raise DockerRuntimeError(
+                f"Failed to read command output from sandbox "
+                f"{sandbox_id!r}"
+            ) from error
 
-        if isinstance(execution.output,tuple):
-            stdout_bytes, stderr_bytes = execution.output
+        finally:
+            if output_stream is not None:
+                close_stream = getattr(output_stream, "close", None)
+                if callable(close_stream):
+                    close_stream()
 
-        elif isinstance(execution.output,bytes):
-            stdout_bytes = execution.output
+        stdout_bytes, stdout_truncated = stdout_buffer.render()
+        stderr_bytes, stderr_truncated = stderr_buffer.render()
 
         return CommandResult(
             sandbox_id=sandbox_id,
-            exit_code=execution.exit_code,
+            exit_code=exit_code,
             stdout=self._decode_output(stdout_bytes),
             stderr=self._decode_output(stderr_bytes),
 
-            timed_out=execution.exit_code in {124,137},
+            # 137 还可能是 OOM Kill 或外部 SIGKILL，不能直接视为超时。
+            timed_out=exit_code == 124,
+
+            stdout_truncated=stdout_truncated,
+            stderr_truncated=stderr_truncated,
         )
 
     def destroy(self,sandbox_id: str) -> None:
@@ -327,3 +404,68 @@ class DockerRuntime:
             "utf-8",
             errors="replace",
         )
+
+class _BoundedByteBuffer:
+    """
+    有界字节缓冲区。
+
+    Docker 命令可能产生几十 MB 甚至更多输出。如果先完整读取再截断，
+    宿主机仍然会占用大量内存。
+
+    这个缓冲区只保留：
+    - 输出开头的一半
+    - 输出结尾的一半
+    """
+
+    def __init__(self, limit: int) -> None:
+        if limit < 2:
+            raise ValueError("buffer limit must be at least 2")
+
+        self.limit = limit
+        self.head_limit = limit // 2
+        self.tail_limit = limit - self.head_limit
+
+        self.head = bytearray()
+        self.tail = bytearray()
+        self.total_bytes = 0
+
+    def append(self, data: bytes | None) -> None:
+        """追加一段 Docker 输出，但不会让缓冲区无限增长。"""
+
+        if not data:
+            return
+
+        self.total_bytes += len(data)
+        remaining = data
+
+        if len(self.head) < self.head_limit:
+            take_count = min(
+                self.head_limit - len(self.head),
+                len(remaining),
+            )
+            self.head.extend(remaining[:take_count])
+            remaining = remaining[take_count:]
+
+        if remaining:
+            self.tail.extend(remaining)
+
+            if len(self.tail) > self.tail_limit:
+                del self.tail[:-self.tail_limit]
+
+    def render(self) -> tuple[bytes, bool]:
+        """返回最终字节内容以及是否发生过截断。"""
+
+        if self.total_bytes <= self.limit:
+            return bytes(self.head + self.tail), False
+
+        omitted = (
+            self.total_bytes
+            - len(self.head)
+            - len(self.tail)
+        )
+
+        marker = (
+            f"\n...[{omitted} bytes omitted by Sandbox Runtime]...\n"
+        ).encode("utf-8")
+
+        return bytes(self.head) + marker + bytes(self.tail), True

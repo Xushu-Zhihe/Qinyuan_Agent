@@ -33,10 +33,11 @@ class MCPServerConfig:
     command: str | None = None
     args: tuple[str,...] = ()
     cwd: Path | None = None
-    env: dict[str,str] = field(default=dict)
+    #env: dict[str,str] = field(default=dict)
+    env: dict[str,str] = field(default_factory=dict)
     url: str | None = None
-    tags: frozenset[set] = frozenset()
-    sandbox_tools: frozenset[set] = frozenset()
+    tags: frozenset[str] = field(default_factory=frozenset)
+    sandbox_tools: frozenset[str] = field(default_factory=frozenset)
     enabled: bool = True
 
 @dataclass(frozen=True, slots=True)
@@ -452,8 +453,24 @@ class MCPManager:
             request,
         )
 
-        stdout,stdout_truncated = self._truncate_output(result.stdout)
-        stderr,stderr_truncated = self._truncate_output(result.stderr)
+        # stdout,stdout_truncated = self._truncate_output(result.stdout)
+        # stderr,stderr_truncated = self._truncate_output(result.stderr)
+        stdout, character_stdout_truncated = self._truncate_output(
+            result.stdout
+        )
+        stderr, character_stderr_truncated = self._truncate_output(
+            result.stderr
+        )
+
+        # Runtime 可能按字节截断，MCPManager 还可能按字符数再次截断。
+        stdout_truncated = (
+            result.stdout_truncated
+            or character_stdout_truncated
+        )
+        stderr_truncated = (
+            result.stderr_truncated
+            or character_stderr_truncated
+        )
 
         if result.timed_out:
             status = "outcome_unknown"
@@ -637,14 +654,14 @@ class AgentMCPClient:
     def call_tool_sync(
         self,
         qualified_name:str,
-        arugments:dict[str,Any],
+        arguments:dict[str,Any],
     ) -> MCPExecutionResult:
         self._ensure_allowed(qualified_name)
 
         return self.manager._execute_bound_tool_sync(
             agent_id=self.agent_id,
             qualified_name=qualified_name,
-            arguments=arugments,
+            arguments=arguments,
         )
 
     def list_tool_specs(self) -> list[dict[str, Any]]:

@@ -1,22 +1,231 @@
+from __future__ import annotations
+
 import json
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import Any, Dict, List, Optional, Sequence
 
-from pydantic import BaseModel, Field
-from langchain_core.tools import StructuredTool
 from langchain_core.messages import (
-    SystemMessage, HumanMessage, AIMessage, ToolMessage
+    AIMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
 )
+from langchain_core.tools import StructuredTool
+from pydantic import BaseModel, Field
 
 
 # ============================================================
 # 1. SkillAgentFactory（现场编译子Agent）
 # ============================================================
+class ToolCallingAgentRunner:
+    """
+    一个轻量级 LangChain Tool Calling Agent。
 
+    这个类不负责创建沙盒。
+    Agent 的工具在创建 Runner 之前就已经绑定到了专属 agent_id。
+    """
+
+    def __init__(
+        self,
+        llm: Any,
+        system_prompt: str,
+        tools: Sequence[StructuredTool],
+        *,
+        max_steps: int = 10,
+    ) -> None:
+        if max_steps < 1:
+            raise ValueError("max_steps must be positive")
+
+        self.system_prompt = system_prompt
+        self.max_steps = max_steps
+
+        self.tools = list(tools)
+        self.tools_map = {
+            tool.name: tool
+            for tool in self.tools
+        }
+
+        self.llm = (
+            llm.bind_tools(self.tools)
+            if self.tools
+            else llm
+        )
+
+    @staticmethod
+    def _serialize_content(value: Any) -> str:
+        """
+        LangChain ToolMessage 的 content 必须是字符串。
+
+        MCP Tool 返回的是 dict，因此统一转成 JSON。
+        """
+
+        if isinstance(value, str):
+            return value
+
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            default=str,
+        )
+
+    @staticmethod
+    def _final_content(response: Any) -> str:
+        """统一处理不同模型返回的 content 类型。"""
+
+        content = getattr(response, "content", "")
+
+        if isinstance(content, str):
+            return content
+
+        return json.dumps(
+            content,
+            ensure_ascii=False,
+            default=str,
+        )
+
+    def _initial_messages(self, input_data: str) -> list[Any]:
+        if not isinstance(input_data, str) or not input_data.strip():
+            raise ValueError("Agent input cannot be empty")
+
+        return [
+            SystemMessage(content=self.system_prompt),
+            HumanMessage(content=input_data.strip()),
+        ]
+
+    def run(self, input_data: str) -> str:
+        """
+        同步执行 Agent。
+
+        如果 Agent 使用 MCP 同步 Tool，该方法必须运行在 MCPManager
+        事件循环之外的线程中。
+        """
+
+        messages = self._initial_messages(input_data)
+
+        for _ in range(self.max_steps):
+            response = self.llm.invoke(messages)
+            messages.append(response)
+
+            tool_calls = getattr(response, "tool_calls", None) or []
+
+            if not tool_calls:
+                return self._final_content(response)
+
+            for tool_call in tool_calls:
+                tool_name = tool_call.get("name", "")
+                tool_args = tool_call.get("args", {})
+                tool_call_id = tool_call.get("id", "")
+
+                tool = self.tools_map.get(tool_name)
+
+                if tool is None:
+                    result: Any = {
+                        "ok": False,
+                        "status": "failed",
+                        "message": f"Unknown tool: {tool_name}",
+                    }
+                else:
+                    try:
+                        result = tool.invoke(tool_args)
+                    except Exception as error:
+                        # 工具异常返回 Agent，不回退到宿主机 subprocess。
+                        result = {
+                            "ok": False,
+                            "status": "failed",
+                            "error": type(error).__name__,
+                            "message": str(error),
+                        }
+
+                messages.append(
+                    ToolMessage(
+                        content=self._serialize_content(result),
+                        tool_call_id=tool_call_id,
+                    )
+                )
+
+        raise RuntimeError(
+            f"Agent exceeded maximum step count: {self.max_steps}"
+        )
+
+    async def arun(self, input_data: str) -> str:
+        """
+        异步执行 Agent。
+
+        Orchestrator 应优先使用这个入口，这样多个 Worker 可以并发运行，
+        并直接调用 StructuredTool 的异步 coroutine。
+        """
+
+        messages = self._initial_messages(input_data)
+
+        for _ in range(self.max_steps):
+            response = await self.llm.ainvoke(messages)
+            messages.append(response)
+
+            tool_calls = getattr(response, "tool_calls", None) or []
+
+            if not tool_calls:
+                return self._final_content(response)
+
+            for tool_call in tool_calls:
+                tool_name = tool_call.get("name", "")
+                tool_args = tool_call.get("args", {})
+                tool_call_id = tool_call.get("id", "")
+
+                tool = self.tools_map.get(tool_name)
+
+                if tool is None:
+                    result: Any = {
+                        "ok": False,
+                        "status": "failed",
+                        "message": f"Unknown tool: {tool_name}",
+                    }
+                else:
+                    try:
+                        result = await tool.ainvoke(tool_args)
+                    except Exception as error:
+                        result = {
+                            "ok": False,
+                            "status": "failed",
+                            "error": type(error).__name__,
+                            "message": str(error),
+                        }
+
+                messages.append(
+                    ToolMessage(
+                        content=self._serialize_content(result),
+                        tool_call_id=tool_call_id,
+                    )
+                )
+
+        raise RuntimeError(
+            f"Agent exceeded maximum step count: {self.max_steps}"
+        )
+
+    def invoke(self, inputs: dict[str, Any]) -> dict[str, str]:
+        """兼容部分 LangChain Runner 的同步接口。"""
+
+        input_data = inputs.get("input", "")
+        return {"output": self.run(str(input_data))}
+
+    async def ainvoke(
+        self,
+        inputs: dict[str, Any],
+    ) -> dict[str, str]:
+        """兼容部分 LangChain Runner 的异步接口。"""
+
+        input_data = inputs.get("input", "")
+        return {"output": await self.arun(str(input_data))}
+
+        
 class SkillAgentFactory:
-    def __init__(self, llm, tool_registry: Optional[Dict[str, Any]] = None):
+    def __init__(
+        self,
+        llm: Any,
+        tool_registry: Optional[
+            Dict[str, StructuredTool]
+        ] = None,
+    ) -> None:
         self.llm = llm
         self.tool_registry = tool_registry or {}
     
@@ -25,27 +234,57 @@ class SkillAgentFactory:
         if not path.exists():
             raise FileNotFoundError(f"Skill '{skill_name}' not found: {path}")
         return path.read_text(encoding="utf-8")
+
+    def create_from_prompt(
+        self,
+        system_prompt: str,
+        *,
+        tools: Optional[Sequence[str]] = None,
+        max_steps: int = 10,
+    ) -> ToolCallingAgentRunner:
+        """
+        直接根据系统提示词创建 Agent。
+
+        BlackboardWorker 使用这个入口，因此暂时不必额外创建大量
+        SKILL.md 文件。
+        """
+
+        if not system_prompt.strip():
+            raise ValueError("system_prompt cannot be empty")
+
+        selected_tools: list[StructuredTool] = []
+
+        for tool_name in tools or ():
+            tool = self.tool_registry.get(tool_name)
+
+            if tool is None:
+                raise KeyError(
+                    f"Tool {tool_name!r} is not registered"
+                )
+
+            selected_tools.append(tool)
+
+        return ToolCallingAgentRunner(
+            llm=self.llm,
+            system_prompt=system_prompt.strip(),
+            tools=selected_tools,
+            max_steps=max_steps,
+        )
     
-    def create(self, skill_name: str, tools: Optional[List[str]] = None, max_steps: int = 10):
-        """
-        返回一个带 .run(input) 和 .invoke({"input": ...}) 方法的 runner 对象。
-        内部自己写 tool calling loop，不依赖 AgentExecutor。
-        """
-        skill_md = self.load_skill_md(skill_name)
-        
-        # 解析工具
-        tool_objs = []
-        tools_map = {}
-        for tname in (tools or []):
-            if tname not in self.tool_registry:
-                raise KeyError(f"Tool '{tname}' not registered")
-            t = self.tool_registry[tname]
-            tool_objs.append(t)
-            tools_map[t.name] = t
-        
-        # LLM 绑定工具
-        llm_with_tools = self.llm.bind_tools(tool_objs) if tool_objs else self.llm
-        
+    def create(
+        self,
+        skill_name: str,
+        tools: Optional[Sequence[str]] = None,
+        max_steps: int = 10,
+    ) -> ToolCallingAgentRunner:
+        """根据 SKILL.md 创建 Agent。"""
+
+        return self.create_from_prompt(
+            self.load_skill_md(skill_name),
+            tools=tools,
+            max_steps=max_steps,
+        )
+
         def _run(input_data: str) -> str:
             messages = [
                 SystemMessage(content=skill_md),
@@ -153,25 +392,52 @@ class MetaAgent:
             self._sessions[sid] = _SessionState()
         return self._sessions[sid]
     
-    def _build_lc_messages(self, sess: _SessionState, user_input: str) -> List:
-        """把内部 dict 历史转成 LangChain Message 对象"""
-        msgs = [SystemMessage(content=self.system_content)]
-        for m in sess.messages:
-            role = m.get("role")
-            content = m.get("content", "")
+    def _build_lc_messages(
+        self,
+        sess: _SessionState,
+    ) -> List:
+        """把内部消息历史转换为 LangChain Message。"""
+
+        messages = [
+            SystemMessage(content=self.system_content)
+        ]
+
+        for message in sess.messages:
+            role = message.get("role")
+            content = message.get("content", "")
+
             if role == "human":
-                msgs.append(HumanMessage(content=content))
+                messages.append(
+                    HumanMessage(content=content)
+                )
+
             elif role == "ai":
-                # 如果有 tool_calls，需要还原 AIMessage 的 tool_calls 字段
-                tcs = m.get("tool_calls")
-                if tcs:
-                    msgs.append(AIMessage(content=content, tool_calls=tcs))
+                tool_calls = message.get("tool_calls")
+
+                if tool_calls:
+                    messages.append(
+                        AIMessage(
+                            content=content,
+                            tool_calls=tool_calls,
+                        )
+                    )
                 else:
-                    msgs.append(AIMessage(content=content))
+                    messages.append(
+                        AIMessage(content=content)
+                    )
+
             elif role == "tool":
-                msgs.append(ToolMessage(content=content, tool_call_id=m.get("tool_call_id", "")))
-        msgs.append(HumanMessage(content=user_input))
-        return msgs
+                messages.append(
+                    ToolMessage(
+                        content=content,
+                        tool_call_id=message.get(
+                            "tool_call_id",
+                            "",
+                        ),
+                    )
+                )
+
+        return messages
     
     def _find_last_spawn_tool_call_id(self, sess: _SessionState) -> str:
         """从最近一条含 tool_calls 的 AI 消息里，找到 spawn_agent 的 call_id"""
@@ -194,7 +460,7 @@ class MetaAgent:
         sess.status = "RUNNING"
         sess.messages.append({"role": "human", "content": user_input})
         
-        msgs = self._build_lc_messages(sess, user_input)
+        msgs = self._build_lc_messages(sess)
         response = self.llm.invoke(msgs)
         
         # 检查是否触发了 spawn_agent

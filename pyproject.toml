@@ -5,8 +5,10 @@ requires-python = ">=3.11,<3.14"
 dependencies = [
     "docker>=7.1,<8",
     "langchain-core>=0.3,<2",
+    "langchain-openai>=0.3,<2",
     "mcp[cli]>=1.9.0",
     "pydantic>=2.7,<3",
+    "python-dotenv>=1,<2",
 ]
 
 [tool.uv]

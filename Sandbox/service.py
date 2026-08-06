@@ -43,36 +43,75 @@ class SandboxService:
         self._registry_lock = RLock()
         self._closed = False
 
-    def start_for_agent(self,agent_id: str) -> SandboxSession:
-        agent_id = agent_id.strip()
+    def start_for_agent(self, agent_id: str) -> SandboxSession:
+        """
+        为一个 Agent 创建或获取专属沙盒。
 
-        if not agent_id:
-            raise SandboxError("agent_id connot be empty")
+        不在 _registry_lock 中创建 Docker 容器，因此不同 Agent 的容器
+        可以并行启动。
+
+        同一个 Agent 使用自己的 agent_lock，避免并发创建两个容器。
+        """
+
+        normalized_agent_id = agent_id.strip()
+
+        if not normalized_agent_id:
+            raise SandboxError("agent_id cannot be empty")
 
         with self._registry_lock:
             if self._closed:
                 raise SandboxError("SandboxService is closed")
 
-            existing_session = self._sessions.get(agent_id)
-
-            if(
-                existing_session is not None
-                and existing_session.status == SandboxStatus.RUNNING
-            ):
-                return existing_session
-
-            sandbox_id = self.runtime.create(agent_id)
-
-            session = SandboxSession(
-                agent_id=agent_id,
-                sandbox_id=sandbox_id,
-                status=SandboxStatus.RUNNING,
+            # 生命周期锁在 Agent 首次出现时创建，并保留到 Service 关闭。
+            agent_lock = self._agent_locks.setdefault(
+                normalized_agent_id,
+                RLock(),
             )
 
-            self._sessions[agent_id] = session
-            self._agent_locks[agent_id] = RLock()
+        # 这里只锁定当前 Agent，不阻塞其他 Agent 创建容器。
+        with agent_lock:
+            with self._registry_lock:
+                if self._closed:
+                    raise SandboxError("SandboxService is closed")
 
-            return session
+                existing_session = self._sessions.get(
+                    normalized_agent_id
+                )
+
+                if (
+                    existing_session is not None
+                    and existing_session.status == SandboxStatus.RUNNING
+                ):
+                    return existing_session
+
+            # Docker 创建容器可能较慢，不能持有全局 registry lock。
+            sandbox_id = self.runtime.create(normalized_agent_id)
+
+            try:
+                with self._registry_lock:
+                    # 创建容器期间 Service 可能被其他线程关闭。
+                    if self._closed:
+                        raise SandboxError(
+                            "SandboxService was closed while the sandbox "
+                            "was being created"
+                        )
+
+                    session = SandboxSession(
+                        agent_id=normalized_agent_id,
+                        sandbox_id=sandbox_id,
+                        status=SandboxStatus.RUNNING,
+                    )
+
+                    self._sessions[normalized_agent_id] = session
+                    return session
+
+            except Exception:
+                # 容器已创建但无法注册时，必须回收，避免孤儿容器。
+                try:
+                    self.runtime.destroy(sandbox_id)
+                except Exception:
+                    pass
+                raise
 
     def execute(
         self,
@@ -113,41 +152,95 @@ class SandboxService:
                 request=request,
             )
 
-    def stop_for_agent(self,agent_id: str) -> None:
+    def stop_for_agent(self, agent_id: str) -> None:
+        """停止并删除指定 Agent 的容器。"""
+
+        normalized_agent_id = agent_id.strip()
+        if not normalized_agent_id:
+            return
+
         with self._registry_lock:
-            agent_lock = self._agent_locks.get(agent_id)
+            agent_lock = self._agent_locks.get(normalized_agent_id)
 
         if agent_lock is None:
-            return 
+            return
 
         with agent_lock:
             with self._registry_lock:
-                session = self._sessions.pop(agent_id,None)
-                self._agent_locks.pop(agent_id,None)
+                session = self._sessions.get(normalized_agent_id)
 
-            if session is not None:
-                self.runtime.destroy(session.sandbox_id)
+            if session is None:
+                return
+
+            # 先销毁容器。销毁失败时保留 session，便于再次清理。
+            self.runtime.destroy(session.sandbox_id)
+
+            with self._registry_lock:
+                current = self._sessions.get(normalized_agent_id)
+
+                if (
+                    current is not None
+                    and current.sandbox_id == session.sandbox_id
+                ):
+                    self._sessions.pop(normalized_agent_id, None)
 
     def get_session(self,agent_id: str) -> SandboxSession | None :
         with self._registry_lock:
             return self._sessions.get(agent_id)
 
     def stop_all(self) -> None:
+        """
+        停止所有 Agent 沙盒。
+
+        使用 _agent_locks 而不是仅使用 _sessions，
+        这样 close() 也会等待正在创建容器的 Agent。
+        """
+
         with self._registry_lock:
-            agent_ids = tuple(self._sessions.keys())
+            agent_ids = tuple(self._agent_locks.keys())
+
+        errors: list[str] = []
 
         for agent_id in agent_ids:
-            self.stop_for_agent(agent_id)
+            try:
+                self.stop_for_agent(agent_id)
+            except Exception as error:
+                errors.append(f"{agent_id}: {error}")
+
+        if errors:
+            raise SandboxError(
+                "Failed to stop one or more sandboxes: "
+                + "; ".join(errors)
+            )
 
     def close(self) -> None:
+        """停止全部容器并关闭 Docker Client。"""
+
         with self._registry_lock:
             if self._closed:
                 return
 
+            # 先禁止创建新的 Agent 沙盒。
             self._closed = True
 
-        self.stop_all()
-        self.runtime.close()
+        errors: list[str] = []
+
+        try:
+            self.stop_all()
+        except Exception as error:
+            errors.append(str(error))
+
+        try:
+            self.runtime.close()
+        except Exception as error:
+            errors.append(f"failed to close sandbox runtime: {error}")
+
+        with self._registry_lock:
+            self._sessions.clear()
+            self._agent_locks.clear()
+
+        if errors:
+            raise SandboxError("; ".join(errors))
 
     def _validate_command(self,request: CommandRequest) -> None:
 

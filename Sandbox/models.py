@@ -9,13 +9,13 @@ class SandboxStatus(StrEnum):
     STOPPED = "stopped"
     FAILED = "failed"
 
-@dataclass(frozen=True)
+@dataclass(frozen=True,slots=True)
 class SandboxSession:
     agent_id: str
     sandbox_id: str
     status: SandboxStatus
 
-@dataclass(frozen=True)
+@dataclass(frozen=True,slots=True)
 class CommandRequest:
     tool: str
     arguments: tuple[str,...] = ()
@@ -25,10 +25,13 @@ class CommandRequest:
     def argv(self) -> list[str]:
         return [self.tool,*self.arguments]
      
-@dataclass(frozen=True)
+@dataclass(frozen=True,slots=True)
 class CommandResult:
     sandbox_id: str
     exit_code: int
     stdout: str
     stderr: str
+
     timed_out: bool = False
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False

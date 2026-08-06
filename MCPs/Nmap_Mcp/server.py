@@ -122,54 +122,81 @@ def _validate_target(target: str) -> tuple[str, bool]:
 
 def _normalize_ports(ports: str) -> str:
     """
-    接受 80、80,443、8000-8100 等格式。
+    校验并标准化 Nmap 端口列表。
 
-    同时限制展开后的端口总量，防止模型意外请求超大扫描范围。
+    支持：
+    - 80
+    - 80,443
+    - 8000-8100
+    - 22,80,443,8000-8100
     """
 
     raw_parts = [part.strip() for part in ports.split(",")]
 
     if not raw_parts or any(not part for part in raw_parts):
-        raise ValueError("ports must be a comma-separated port list")
+        raise ValueError(
+            "ports must be a comma-separated port list"
+        )
 
     normalized_parts: list[str] = []
     total_ports = 0
 
+    # 环境配置只读取一次，不需要在每个端口循环中重复读取。
+    maximum = _maximum_port_count()
+
     for part in raw_parts:
         if "-" in part:
             if part.count("-") != 1:
-                raise ValueError(f"invalid port range: {part!r}")
+                raise ValueError(
+                    f"invalid port range: {part!r}"
+                )
 
-            start_text, end_text = part.split("-", maxsplit=1)
+            start_text, end_text = part.split(
+                "-",
+                maxsplit=1,
+            )
 
-            if not start_text.isdigit() or not end_text.isdigit():
-                raise ValueError(f"invalid port range: {part!r}")
+            if (
+                not start_text.isdigit()
+                or not end_text.isdigit()
+            ):
+                raise ValueError(
+                    f"invalid port range: {part!r}"
+                )
 
             start = int(start_text)
             end = int(end_text)
 
             if not 1 <= start <= end <= 65_535:
-                raise ValueError(f"invalid port range: {part!r}")
+                raise ValueError(
+                    f"invalid port range: {part!r}"
+                )
 
             total_ports += end - start + 1
             normalized_parts.append(f"{start}-{end}")
 
         else:
             if not part.isdigit():
-                raise ValueError(f"invalid port: {part!r}")
+                raise ValueError(
+                    f"invalid port: {part!r}"
+                )
 
             port = int(part)
+
             if not 1 <= port <= 65_535:
-                raise ValueError(f"invalid port: {port}")
+                raise ValueError(
+                    f"invalid port: {port}"
+                )
 
             total_ports += 1
             normalized_parts.append(str(port))
 
-        maximum = _maximum_port_count()
-    if total_ports > maximum:
-        raise ValueError(
-            f"requested {total_ports} ports; maximum is {maximum}"
-        )
+        # 尽早拒绝超大端口范围，不必继续处理后面的字符串。
+        if total_ports > maximum:
+            raise ValueError(
+                f"requested {total_ports} ports; "
+                f"maximum is {maximum}"
+            )
 
     return ",".join(normalized_parts)
 
