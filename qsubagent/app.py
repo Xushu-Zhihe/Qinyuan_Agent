@@ -4,8 +4,6 @@ import argparse
 import asyncio
 from typing import Sequence
 
-from openai import AsyncOpenAI
-
 from .agent import AgentRunner
 from .approval import ApprovalManager
 from .config import AppSettings
@@ -24,15 +22,7 @@ async def run_async(*, execution_mode: str | None = None) -> None:
     )
     load_builtin_tools()
 
-    client_kwargs = {
-        "api_key": settings.model.api_key or None,
-        "timeout": settings.runtime.model_timeout_seconds,
-        "max_retries": 0,
-    }
-    if settings.model.base_url:
-        client_kwargs["base_url"] = settings.model.base_url
-
-    client = AsyncOpenAI(**client_kwargs)
+    client = create_client(settings)
     repository = ThreadRepository(
         settings.runtime.state_dir,
         settings.runtime.thread_id,
@@ -55,6 +45,19 @@ async def run_async(*, execution_mode: str | None = None) -> None:
         await client.close()
         raise
     await run_console(agent, client)
+
+
+def create_client(settings: AppSettings):
+    from openai import AsyncOpenAI
+
+    client_kwargs = {
+        "api_key": settings.model.api_key or None,
+        "timeout": settings.runtime.model_timeout_seconds,
+        "max_retries": 0,
+    }
+    if settings.model.base_url:
+        client_kwargs["base_url"] = settings.model.base_url
+    return AsyncOpenAI(**client_kwargs)
 
 
 def run(argv: Sequence[str] | None = None) -> None:

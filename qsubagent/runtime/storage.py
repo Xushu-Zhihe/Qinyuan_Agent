@@ -18,6 +18,7 @@ _THREAD_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 _TERMINAL_TOOL_STATUSES = {
     "completed",
     "failed",
+    "timeout",
     "aborted",
     "outcome_unknown",
 }
@@ -93,6 +94,15 @@ class ThreadRepository:
             active_turn_id=row["active_turn_id"],
             paused_reason=row["paused_reason"],
         )
+
+    def tool_call_statuses(self) -> tuple[str, ...]:
+        """Return durable tool outcomes for provider-level status mapping."""
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                "SELECT status FROM tool_calls WHERE thread_id = ? ORDER BY created_at",
+                (self.thread_id,),
+            ).fetchall()
+        return tuple(str(row["status"]) for row in rows)
 
     def save_state(self, state: ThreadState) -> None:
         """Compatibility entrypoint; new code should use transactional methods."""

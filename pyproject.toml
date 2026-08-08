@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qinyuan-agent"
+version = "1.0.0"
+description = "Qinyuan host Agent provider"
+requires-python = ">=3.11"
+dependencies = ["openai>=2.46.0", "PyYAML>=6.0"]
+
+[project.scripts]
+qinyuan-main = "qsubagent.provider:run"
+
+[tool.setuptools]
+packages = ["qsubagent", "qsubagent.runtime", "qsubagent.security", "qsubagent.sandbox", "qsubagent.mcp", "tools", "skills", "MCP", "MCP.Nmap_Mcp"]

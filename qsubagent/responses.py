@@ -31,7 +31,7 @@ def build_tool_outputs(
     outputs: list[dict[str, Any]] = []
     for call_id, call in pending_calls.items():
         status = str(call.get("status", "aborted"))
-        if status in {"completed", "failed"} and call.get("output") is not None:
+        if status in {"completed", "failed", "timeout"} and call.get("output") is not None:
             output = str(call.get("output", ""))
         else:
             error = (

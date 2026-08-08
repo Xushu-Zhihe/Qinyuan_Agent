@@ -78,6 +78,26 @@ class SkillSettings:
 
 
 @dataclass(frozen=True)
+class ProviderSettings:
+    profile: str = "interactive_unrestricted"
+    profile_version: int = 1
+
+
+@dataclass(frozen=True)
+class McpSettings:
+    startup_timeout_seconds: float = 5.0
+    call_timeout_seconds: float = 10.0
+    shutdown_timeout_seconds: float = 2.0
+
+
+@dataclass(frozen=True)
+class BridgeSettings:
+    connect_timeout_seconds: float = 5.0
+    response_grace_seconds: float = 10.0
+    max_response_bytes: int = 512 * 1024
+
+
+@dataclass(frozen=True)
 class AppSettings:
     model: ModelSettings
     capabilities: CapabilitySettings
@@ -85,6 +105,9 @@ class AppSettings:
     artifacts: ArtifactSettings = field(default_factory=ArtifactSettings)
     powershell: PowerShellSettings = field(default_factory=PowerShellSettings)
     skills: SkillSettings = field(default_factory=SkillSettings)
+    provider: ProviderSettings = field(default_factory=ProviderSettings)
+    mcp: McpSettings = field(default_factory=McpSettings)
+    bridge: BridgeSettings = field(default_factory=BridgeSettings)
 
     @classmethod
     def load(
@@ -102,6 +125,9 @@ class AppSettings:
         artifacts_raw = _mapping(raw, "artifacts")
         powershell_raw = _mapping(raw, "powershell")
         skills_raw = _mapping(raw, "skills")
+        provider_raw = _mapping(raw, "provider")
+        mcp_raw = _mapping(raw, "mcp")
+        bridge_raw = _mapping(raw, "bridge")
 
         state_dir = _path(runtime_raw.get("state_dir", "var/threads"))
         artifact_root = _path(artifacts_raw.get("root", "var/artifacts"))
@@ -212,6 +238,32 @@ class AppSettings:
                     skills_raw, "resource_max_bytes", 2 * 1024 * 1024
                 ),
             ),
+            provider=ProviderSettings(
+                profile=str(
+                    provider_raw.get("profile", "interactive_unrestricted")
+                ).strip(),
+                profile_version=_int(provider_raw, "profile_version", 1),
+            ),
+            mcp=McpSettings(
+                startup_timeout_seconds=_float(
+                    mcp_raw, "startup_timeout_seconds", 5.0
+                ),
+                call_timeout_seconds=_float(mcp_raw, "call_timeout_seconds", 10.0),
+                shutdown_timeout_seconds=_float(
+                    mcp_raw, "shutdown_timeout_seconds", 2.0
+                ),
+            ),
+            bridge=BridgeSettings(
+                connect_timeout_seconds=_float(
+                    bridge_raw, "connect_timeout_seconds", 5.0
+                ),
+                response_grace_seconds=_float(
+                    bridge_raw, "response_grace_seconds", 10.0
+                ),
+                max_response_bytes=_int(
+                    bridge_raw, "max_response_bytes", 512 * 1024
+                ),
+            ),
         )
         settings.validate()
         return settings
@@ -223,6 +275,14 @@ class AppSettings:
             raise ValueError(
                 "powershell.mode 必须是 unrestricted 或 approval"
             )
+        if self.provider.profile not in {
+            "interactive_unrestricted",
+            "no_tools",
+            "nmap_optional",
+        }:
+            raise ValueError("provider.profile is unknown")
+        if self.provider.profile_version != 1:
+            raise ValueError("provider.profile_version is unsupported")
         if not 0 < self.runtime.compact_ratio < 1:
             raise ValueError("runtime.compact_ratio 必须在 0 和 1 之间")
         positive_values = {
@@ -247,6 +307,13 @@ class AppSettings:
             "artifacts.read_max_bytes": self.artifacts.read_max_bytes,
             "skills.content_max_bytes": self.skills.content_max_bytes,
             "skills.resource_max_bytes": self.skills.resource_max_bytes,
+            "provider.profile_version": self.provider.profile_version,
+            "mcp.startup_timeout_seconds": self.mcp.startup_timeout_seconds,
+            "mcp.call_timeout_seconds": self.mcp.call_timeout_seconds,
+            "mcp.shutdown_timeout_seconds": self.mcp.shutdown_timeout_seconds,
+            "bridge.connect_timeout_seconds": self.bridge.connect_timeout_seconds,
+            "bridge.response_grace_seconds": self.bridge.response_grace_seconds,
+            "bridge.max_response_bytes": self.bridge.max_response_bytes,
         }
         for name, value in positive_values.items():
             if value <= 0:

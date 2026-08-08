@@ -133,4 +133,25 @@ $env:QSUBAGENT_BASE_URL = "兼容服务地址"  # 使用官方地址时可不设
 python -m unittest tests.test_real_api -v
 ```
 
+## Bat provider mode
+
+Install the host provider with `pip install -e .`; this exposes
+`qinyuan-main`. It reads one UTF-8 task from stdin, then emits one protocol line
+and exits. A controlled bat invocation sets `QINYUAN_RUN_CONTEXT_FILE`; an
+`nmap_optional` run additionally sets `QINYUAN_SANDBOX_TOKEN_FILE`. The token
+is read once and never enters the prompt, MCP environment, URL, or logs.
+
+Profiles are explicit: `interactive_unrestricted` keeps the interactive
+PowerShell experience, `no_tools` is the planning profile, and
+`nmap_optional` exposes only the managed `nmap_tcp_scan` proxy. Run
+`python -m qsubagent.provider --preflight nmap_optional` to check a profile
+without starting a model or MCP process.
+
+The private Nmap MCP is a stdio child and starts only on the first valid scan.
+It generates fixed `-sT -Pn -n` argv and delegates execution to the qinyuan-bat
+loopback bridge. Bridge and Docker failures fail closed. The provider preserves
+the Blackboard `BLACKBOARD_INTENT:` line used during planning and the strict
+`BLACKBOARD_RESULT:` line used during execution; failed, cancelled, timed-out,
+and uncertain runs exit non-zero with an explicit status payload.
+
 该测试执行“发现 Skill -> 读取 Skill -> 多轮工具 -> 中断 -> 重启 -> 恢复 -> 完成任务”。只有它在目标服务和真实凭据下通过后，才能宣称真实模型完整验收完成。

@@ -9,10 +9,17 @@ _SENSITIVE_KEYS = {
     "apikey",
     "accesstoken",
     "refreshtoken",
+    "token",
+    "bearertoken",
+    "sandboxtoken",
+    "password",
+    "secret",
+    "clientsecret",
     "cookie",
     "setcookie",
 }
 _PATTERNS = (
+    re.compile(r"(?i)(https?://)([^/\s:@]+):([^@\s/]+)@"),
     re.compile(
         r"(?i)(authorization\s*[:=]\s*(?:bearer\s+)?)([^\s,;]+)"
     ),
@@ -26,8 +33,9 @@ _PATTERNS = (
 
 def redact_text(value: str) -> str:
     redacted = value
-    for pattern in _PATTERNS:
-        redacted = pattern.sub(r"\1[REDACTED]", redacted)
+    for index, pattern in enumerate(_PATTERNS):
+        replacement = r"\1[REDACTED]@" if index == 0 else r"\1[REDACTED]"
+        redacted = pattern.sub(replacement, redacted)
     return redacted
 
 

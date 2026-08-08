@@ -10,6 +10,19 @@ from qsubagent.security import redact_data, redact_text
 
 
 class RedactionTests(unittest.TestCase):
+    def test_generic_secrets_and_credentialed_urls_are_redacted(self) -> None:
+        value = {
+            "sandbox_token": "bridge-secret",
+            "password": "pw-secret",
+            "nested": "https://user:pass@example.test/path",
+        }
+
+        redacted = redact_data(value)
+
+        self.assertEqual(redacted["sandbox_token"], "[REDACTED]")
+        self.assertEqual(redacted["password"], "[REDACTED]")
+        self.assertNotIn("user:pass", redacted["nested"])
+
     def test_sensitive_headers_and_fields_are_redacted(self) -> None:
         data = redact_data(
             {

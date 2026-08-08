@@ -545,6 +545,9 @@ class AgentRunner:
         if turn.process_controller is not None:
             with suppress(Exception):
                 await turn.process_controller.terminate_tree()
+        if turn.cancel_callback is not None:
+            with suppress(Exception):
+                await turn.cancel_callback()
 
         try:
             await asyncio.wait_for(

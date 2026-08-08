@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from typing import Any
+from collections.abc import Awaitable, Callable
 
 
 @dataclass
@@ -33,6 +34,7 @@ class ActiveTurn:
     running_call_id: str | None = None
     running_tool_side_effect: bool = False
     interrupted_tool_result: "ToolResult | None" = None
+    cancel_callback: Callable[[], Awaitable[bool]] | None = None
 
 
 @dataclass(frozen=True)
