@@ -1,13 +1,8 @@
 {
-  "mcpServers":{
-      "nmap-demo":{
-          "command":"uv",
-          "args":[
-              "--directory",
-              "/home/autyui/桌面/Agent/Mcp/MCPS/Burp_Suite_Mcp",
-              "run",
-              "server.py"
-          ]
-      }
+  "mcpServers": {
+    "burp": {
+      "command": "python",
+      "args": ["server.py"]
+    }
   }
 }

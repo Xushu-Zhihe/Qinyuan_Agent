@@ -1,13 +1,8 @@
 {
-    "mcpServers": {
-        "amass-demo": {
-            "command": "uv",
-            "args": [
-                "--directory",
-                "C:\\Users\\lenovo\\Desktop\\agent\\Qinyuan_Agent\\MCPs\\Amass_Mcp",
-                "run",
-                "server.py"
-            ]
-        }
+  "mcpServers": {
+    "amass": {
+      "command": "python",
+      "args": ["server.py"]
     }
+  }
 }

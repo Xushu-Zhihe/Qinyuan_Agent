@@ -1,225 +1,187 @@
-"""
-FFUF MCP Server - 基于 ffuf 的 Web 模糊测试 MCP 服务器
-提供目录发现、API 端点发现、隐藏路径发现功能
-"""
+from __future__ import annotations
 
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent
-import asyncio
-import json
 import os
-import sys
-import tempfile
-import uuid
+import re
+from typing import Any
+from urllib.parse import urlparse
+
+from mcp.server.fastmcp import FastMCP
 
 
-# 根据操作系统选择 ffuf 命令
-FFUF_CMD = "ffuf.exe" if sys.platform.startswith("win") else "ffuf"
+mcp = FastMCP(
+    "qinyuan-ffuf-command-planner",
+    instructions=(
+        "Validate authorized web-fuzzing requests and return sandbox_command "
+        "objects. This server never executes ffuf."
+    ),
+    json_response=True,
+)
 
-# 创建 MCP 服务器实例
-server = Server("ffuf-mcp")
+_WORDLISTS = {
+    "common": "/opt/qinyuan/wordlists/common.txt",
+    "directories": "/opt/qinyuan/wordlists/directories.txt",
+    "api": "/opt/qinyuan/wordlists/api.txt",
+}
+_EXTENSION_PATTERN = re.compile(r"^[A-Za-z0-9]{1,12}$")
 
 
-def parse_ffuf_output(output: str) -> list[dict]:
-    """
-    解析 ffuf 的 JSON 输出
-    将 ffuf 返回的 JSON 结果转换为标准字典格式
-    """
-    results = []
+def _allowed_hosts() -> tuple[str, ...]:
+    raw = os.getenv("MCP_FFUF_ALLOWED_HOSTS", "127.0.0.1,localhost,target-web")
+    return tuple(item.strip().lower() for item in raw.split(",") if item.strip())
+
+
+def _validate_target(target: str) -> str:
+    candidate = target.strip()
+    if "FUZZ" not in candidate:
+        raise ValueError("target must contain the FUZZ keyword")
+    if len(candidate) > 2048 or any(c in candidate for c in "\r\n\t"):
+        raise ValueError("target is invalid")
+    parsed = urlparse(candidate.replace("FUZZ", "qinyuan-placeholder"))
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("target must be an http or https URL")
+    host = parsed.hostname.lower().rstrip(".")
+    allowed = any(
+        host == rule.rstrip(".")
+        or (rule.startswith("*.") and host.endswith(rule[1:]))
+        for rule in _allowed_hosts()
+    )
+    if not allowed:
+        raise PermissionError(f"target host {host!r} is not authorized")
+    return candidate
+
+
+def _validate_wordlist(name: str) -> str:
     try:
-        data = json.loads(output)
-        for item in data.get("results", []):
-            results.append({
-                "url": item.get("url", ""),
-                "status": item.get("status", 0),
-                "length": item.get("length", 0),
-                "words": item.get("words", 0),
-                "lines": item.get("lines", 0),
-                "content-type": item.get("content-type", "")
-            })
-    except json.JSONDecodeError:
-        pass
-    return results
+        return _WORDLISTS[name.strip().lower()]
+    except KeyError as exc:
+        raise ValueError(f"wordlist must be one of {sorted(_WORDLISTS)}") from exc
 
 
-async def run_ffuf(args: list) -> list[dict]:
-    """
-    异步执行 ffuf 命令并返回解析后的结果
-    使用临时文件存储 JSON 输出，避免日志干扰
-    """
-    try:
-        # 使用临时文件存储 JSON 输出，Windows 兼容
-        output_file = os.path.join(tempfile.gettempdir(), f"ffuf_{uuid.uuid4().hex}.json")
-
-        # 添加输出参数
-        ffuf_args = args + ["-of", "json", "-o", output_file]
-
-        # 创建子进程执行 ffuf
-        proc = await asyncio.create_subprocess_exec(
-            FFUF_CMD,
-            *ffuf_args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await proc.communicate()
-
-        # 从临时文件读取 JSON 结果
-        try:
-            with open(output_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            return parse_ffuf_results(data)
-        except (FileNotFoundError, json.JSONDecodeError):
-            # 回退：尝试解析 stdout
-            if stdout:
-                return parse_ffuf_output(stdout.decode())
-            return []
-        finally:
-            # 清理临时文件
-            try:
-                os.unlink(output_file)
-            except:
-                pass
-    except FileNotFoundError:
-        raise Exception("ffuf 未找到，请先安装 ffuf")
-    except Exception as e:
-        raise Exception(f"ffuf 执行错误: {str(e)}")
+def _validate_extensions(values: list[str] | None) -> list[str]:
+    extensions = values or []
+    if len(extensions) > 20:
+        raise ValueError("extensions cannot contain more than 20 values")
+    normalized = []
+    for value in extensions:
+        item = value.strip().lstrip(".").lower()
+        if not _EXTENSION_PATTERN.fullmatch(item):
+            raise ValueError(f"invalid extension: {value!r}")
+        normalized.append(item)
+    return list(dict.fromkeys(normalized))
 
 
-def parse_ffuf_results(data: dict) -> list[dict]:
-    """解析 ffuf JSON 文件格式的结果"""
-    results = []
-    for item in data.get("results", []):
-        results.append({
-            "url": item.get("url", ""),
-            "status": item.get("status", 0),
-            "length": item.get("length", 0),
-            "words": item.get("words", 0),
-            "lines": item.get("lines", 0),
-            "content-type": item.get("content-type", "")
-        })
-    return results
+def _validate_rate(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 500:
+        raise ValueError("rate must be an integer between 1 and 500")
+    return value
 
 
-@server.list_tools()
-async def list_tools() -> list[Tool]:
-    """
-    列出所有可用的工具
-    MCP 协议要求实现 list_tools 回调
-    """
-    return [
-        # 目录发现工具
-        Tool(
-            name="discover_directories",
-            description="使用 ffuf 发现 Web 服务器上的目录",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "target": {"type": "string", "description": "目标 URL，需包含 FUZZ 关键字 (如 http://example.com/FUZZ)"},
-                    "wordlist": {"type": "string", "description": "字典文件路径"},
-                    "extensions": {"type": "array", "items": {"type": "string"}, "description": "要尝试的文件扩展名"},
-                    "rate": {"type": "number", "description": "每秒请求数", "default": 100}
-                },
-                "required": ["target", "wordlist"]
-            }
-        ),
-        # API 端点发现工具
-        Tool(
-            name="discover_api_endpoints",
-            description="使用 ffuf 发现 API 端点",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "target": {"type": "string", "description": "目标 URL，需包含 FUZZ 关键字"},
-                    "wordlist": {"type": "string", "description": "API 字典路径"},
-                    "methods": {"type": "array", "items": {"type": "string"}, "description": "要测试的 HTTP 方法", "default": ["GET"]},
-                    "rate": {"type": "number", "description": "每秒请求数", "default": 100}
-                },
-                "required": ["target", "wordlist"]
-            }
-        ),
-        # 隐藏路径发现工具
-        Tool(
-            name="discover_hidden_paths",
-            description="发现隐藏路径、备份文件和其他敏感文件",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "target": {"type": "string", "description": "目标 URL，需包含 FUZZ 关键字"},
-                    "wordlist": {"type": "string", "description": "字典路径"},
-                    "extensions": {"type": "array", "items": {"type": "string"}, "description": "要尝试的扩展名 (默认: bak,old,backup)"},
-                    "rate": {"type": "number", "description": "每秒请求数", "default": 100}
-                },
-                "required": ["target", "wordlist"]
-            }
-        )
+def _validate_timeout(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 5 <= value <= 300:
+        raise ValueError("timeout_seconds must be an integer between 5 and 300")
+    return value
+
+
+def _plan(
+    target: str,
+    wordlist: str,
+    *,
+    method: str,
+    extensions: list[str],
+    rate: int,
+    timeout_seconds: int,
+    match_codes: str,
+) -> dict[str, Any]:
+    arguments = [
+        "-u", target,
+        "-w", wordlist,
+        "-X", method,
+        "-rate", str(_validate_rate(rate)),
+        "-mc", match_codes,
+        "-s",
+        "-json",
     ]
+    if extensions:
+        arguments.extend(["-e", ",".join(f".{item}" for item in extensions)])
+    return {
+        "sandbox_command": {
+            "tool": "ffuf",
+            "arguments": arguments,
+            "timeout_seconds": _validate_timeout(timeout_seconds),
+        },
+        "request": {
+            "operation": "fuzz",
+            "target": target,
+            "method": method,
+            "wordlist": wordlist,
+        },
+    }
 
 
-@server.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-    """
-    处理工具调用请求
-    根据工具名称调用相应的 ffuf 命令
-    """
-    try:
-        target = arguments["target"]
-        wordlist = arguments["wordlist"]
-        rate = arguments.get("rate", 100)
-
-        if name == "discover_directories":
-            # 目录发现
-            args = ["-u", target, "-w", wordlist, "-rate", str(rate),
-                    "-mc", "200,204,301,302,307,308,401,403,500"]
-            if "extensions" in arguments and arguments["extensions"]:
-                args.extend(["-e", ",".join(arguments["extensions"])])
-            results = await run_ffuf(args)
-
-        elif name == "discover_api_endpoints":
-            # API 端点发现 - ffuf -X 只支持单个方法，需对每个方法单独执行
-            methods = arguments.get("methods", ["GET"])
-            all_results = []
-            for method in methods:
-                args = ["-u", target, "-w", wordlist, "-rate", str(rate), "-X", method.upper(),
-                        "-mc", "200,201,204,301,302,307,308,401,403,405,500"]
-                results = await run_ffuf(args)
-                for r in results:
-                    r["method"] = method.upper()
-                all_results.extend(results)
-            # 去重
-            seen = set()
-            results = []
-            for r in all_results:
-                key = (r["url"], r["method"])
-                if key not in seen:
-                    seen.add(key)
-                    results.append(r)
-
-        elif name == "discover_hidden_paths":
-            # 隐藏路径发现
-            args = ["-u", target, "-w", wordlist, "-rate", str(rate),
-                    "-mc", "200,204,301,302,307,308,401,403,500"]
-            exts = arguments.get("extensions") if "extensions" in arguments and arguments["extensions"] else ["bak", "old", "backup", "swp", "tmp", "log", "conf", "config"]
-            args.extend(["-e", ",".join(exts)])
-            results = await run_ffuf(args)
-
-        else:
-            raise ValueError(f"未知工具: {name}")
-
-        return [TextContent(type="text", text=json.dumps(results, indent=2))]
-
-    except Exception as e:
-        return [TextContent(type="text", text=json.dumps({"error": str(e)}, indent=2))]
+@mcp.tool(title="FFUF Directory Discovery")
+def discover_directories(
+    target: str,
+    wordlist: str = "directories",
+    extensions: list[str] | None = None,
+    rate: int = 100,
+    timeout_seconds: int = 120,
+) -> dict[str, Any]:
+    return _plan(
+        _validate_target(target),
+        _validate_wordlist(wordlist),
+        method="GET",
+        extensions=_validate_extensions(extensions),
+        rate=rate,
+        timeout_seconds=timeout_seconds,
+        match_codes="200,204,301,302,307,308,401,403,500",
+    )
 
 
-async def main():
-    """
-    主入口函数
-    启动 MCP 服务器并通过 stdio 通信
-    """
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(read_stream, write_stream, server.create_initialization_options())
+@mcp.tool(title="FFUF API Endpoint Discovery")
+def discover_api_endpoints(
+    target: str,
+    method: str = "GET",
+    wordlist: str = "api",
+    rate: int = 100,
+    timeout_seconds: int = 120,
+) -> dict[str, Any]:
+    normalized_method = method.strip().upper()
+    if normalized_method not in {"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"}:
+        raise ValueError("method is not allowed")
+    return _plan(
+        _validate_target(target),
+        _validate_wordlist(wordlist),
+        method=normalized_method,
+        extensions=[],
+        rate=rate,
+        timeout_seconds=timeout_seconds,
+        match_codes="200,201,204,301,302,307,308,401,403,405,500",
+    )
+
+
+@mcp.tool(title="FFUF Hidden Path Discovery")
+def discover_hidden_paths(
+    target: str,
+    wordlist: str = "common",
+    extensions: list[str] | None = None,
+    rate: int = 75,
+    timeout_seconds: int = 120,
+) -> dict[str, Any]:
+    default_extensions = ["bak", "old", "backup", "swp", "tmp", "log", "conf"]
+    return _plan(
+        _validate_target(target),
+        _validate_wordlist(wordlist),
+        method="GET",
+        extensions=_validate_extensions(extensions or default_extensions),
+        rate=rate,
+        timeout_seconds=timeout_seconds,
+        match_codes="200,204,301,302,307,308,401,403,500",
+    )
+
+
+def main() -> None:
+    mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

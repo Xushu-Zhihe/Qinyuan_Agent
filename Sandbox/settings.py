@@ -4,7 +4,7 @@ from dataclasses import dataclass,field
 
 @dataclass(frozen=True)
 class SandboxSettings:
-    image: str = "qinyuan/pentest-sandbox:0.1.0"
+    image: str = "qinyuan/pentest-sandbox:0.2.0"
     network: str = "qinyuan_pentest_lab"
     
     memory_limit: str = "512m"
@@ -31,6 +31,12 @@ class SandboxSettings:
             {
                 "nmap",
                 "curl",
+                "subfinder",
+                "amass",
+                "httpx",
+                "ffuf",
+                "dirsearch",
+                "nuclei",
             }
         )
     )

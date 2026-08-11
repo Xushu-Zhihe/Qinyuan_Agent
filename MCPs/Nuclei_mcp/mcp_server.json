@@ -1,13 +1,8 @@
 {
   "mcpServers": {
-    "nuclei-mcp": {
-      "command": "uv",
-      "args": [
-        "--directory",
-        "你的 Nuclei_mcp 目录",
-        "run",
-        "server.py"
-      ]
+    "nuclei": {
+      "command": "python",
+      "args": ["server.py"]
     }
   }
 }

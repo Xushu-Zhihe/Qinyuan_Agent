@@ -1,121 +1,142 @@
+from __future__ import annotations
+
 from typing import Any
 
+from nuclei_mcp.config import DEFAULT_TEMPLATES_DIR, DEFAULT_TIMEOUT_SECONDS
+from nuclei_mcp.runner import base_scan_arguments, command_plan
 from nuclei_mcp.security import (
-    validate_target,
-    validate_template as validate_template_path,
-    validate_timeout,
+    validate_int_range,
     validate_severity,
     validate_tags,
-    validate_int_range
+    validate_target,
+    validate_template,
+    validate_template_id,
+    validate_timeout,
 )
-from nuclei_mcp.runner import (
-    check_installation, 
-    run_scan_sync ,
-    validate_template_sync,
-    list_templates_sync,
-    read_template_info_sync,
-    run_scan_by_tags_sync,
-    find_template_by_id_sync,
-    run_scan_by_template_id_sync
-)
-from nuclei_mcp.config import DEFAULT_TIMEOUT_SECONDS
 
 
 def register_tools(mcp: Any) -> None:
-    @mcp.tool()
-    def check_nuclei_installation() -> dict[str, Any]:
-        return check_installation()
-    
-    @mcp.tool()
+    @mcp.tool(title="Nuclei Version")
+    def check_nuclei_installation(timeout_seconds: int = 15) -> dict[str, Any]:
+        return command_plan(
+            ["-version"],
+            validate_timeout(timeout_seconds),
+            {"operation": "version"},
+        )
+
+    @mcp.tool(title="Nuclei Authorized Scan")
     def run_scan(
         target: str,
         template: str = "",
-        timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
+        severity: str = "",
+        timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
     ) -> dict[str, Any]:
-        
-        target = validate_target(target)
-        template = validate_template_path(template)
-        timeout_seconds = validate_timeout(timeout_seconds)
-
-        return run_scan_sync(
-            target=target,
-            template=template,
-            timeout_seconds=timeout_seconds,
+        normalized_target = validate_target(target)
+        normalized_template = validate_template(template)
+        normalized_severity = validate_severity(severity)
+        arguments = base_scan_arguments(normalized_target)
+        if normalized_template:
+            arguments[3] = f"{DEFAULT_TEMPLATES_DIR}/{normalized_template}"
+        if normalized_severity:
+            arguments.extend(["-s", normalized_severity])
+        return command_plan(
+            arguments,
+            validate_timeout(timeout_seconds),
+            {"operation": "scan", "target": normalized_target},
         )
-    
-    @mcp.tool()
+
+    @mcp.tool(title="Nuclei Validate Official Template")
     def validate_template(
         template: str,
-        timeout_seconds:int = 60,
+        timeout_seconds: int = 60,
     ) -> dict[str, Any]:
-        template = validate_template_path(template)
-        timeout_seconds = validate_timeout(timeout_seconds)
-
-        return validate_template_sync(
-            template=template,
-            timeout_seconds=timeout_seconds,
+        normalized = globals()["validate_template"](template)
+        if not normalized:
+            raise ValueError("template cannot be empty")
+        path = f"{DEFAULT_TEMPLATES_DIR}/{normalized}"
+        return command_plan(
+            ["-validate", "-t", path, "-duc"],
+            validate_timeout(timeout_seconds),
+            {"operation": "validate-template", "template": normalized},
         )
-    
-    @mcp.tool()
+
+    @mcp.tool(title="Nuclei List Templates")
     def list_templates(
-        templates_dir: str = "",
-        keyword: str = "",
+        tags: list[str] | None = None,
+        severity: str = "",
         limit: int = 50,
+        timeout_seconds: int = 60,
     ) -> dict[str, Any]:
-        limit = validate_int_range(limit, "limit", 1, 200)
-
-        return list_templates_sync(
-            templates_dir=templates_dir,
-            keyword=keyword,
-            limit=limit,
+        arguments = ["-tl", "-t", DEFAULT_TEMPLATES_DIR, "-duc"]
+        if tags:
+            arguments.extend(["-tags", ",".join(validate_tags(tags))])
+        normalized_severity = validate_severity(severity)
+        if normalized_severity:
+            arguments.extend(["-s", normalized_severity])
+        return command_plan(
+            arguments,
+            validate_timeout(timeout_seconds),
+            {"operation": "list-templates", "result_limit_hint": validate_int_range(limit, "limit", 1, 200)},
         )
-    
-    @mcp.tool()
-    def read_template_info(template: str) -> dict[str, Any]:
-        template = validate_template_path(template)
-        return read_template_info_sync(template)
 
-    @mcp.tool()
+    @mcp.tool(title="Nuclei Display Template")
+    def read_template_info(
+        template: str,
+        timeout_seconds: int = 30,
+    ) -> dict[str, Any]:
+        normalized = globals()["validate_template"](template)
+        if not normalized:
+            raise ValueError("template cannot be empty")
+        return command_plan(
+            ["-td", "-t", f"{DEFAULT_TEMPLATES_DIR}/{normalized}", "-duc"],
+            validate_timeout(timeout_seconds),
+            {"operation": "display-template", "template": normalized},
+        )
+
+    @mcp.tool(title="Nuclei Scan By Tags")
     def run_scan_by_tags(
         target: str,
         tags: list[str],
         severity: str = "",
         timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
     ) -> dict[str, Any]:
-        target = validate_target(target)
-        timeout_seconds = validate_timeout(timeout_seconds)
-
-        return run_scan_by_tags_sync(
-            target=target,
-            tags=validate_tags(tags),
-            severity=validate_severity(severity),
-            timeout_seconds=timeout_seconds,
+        normalized_target = validate_target(target)
+        normalized_tags = validate_tags(tags)
+        arguments = base_scan_arguments(normalized_target)
+        arguments.extend(["-tags", ",".join(normalized_tags)])
+        normalized_severity = validate_severity(severity)
+        if normalized_severity:
+            arguments.extend(["-s", normalized_severity])
+        return command_plan(
+            arguments,
+            validate_timeout(timeout_seconds),
+            {"operation": "scan-by-tags", "target": normalized_target, "tags": normalized_tags},
         )
-    
-    @mcp.tool()
+
+    @mcp.tool(title="Nuclei Find Template By ID")
     def find_template_by_id(
         template_id: str,
-        templates_dir: str = "",
+        timeout_seconds: int = 60,
     ) -> dict[str, Any]:
-        return find_template_by_id_sync(
-            template_id=template_id,
-            templates_dir=templates_dir,
+        normalized = validate_template_id(template_id)
+        return command_plan(
+            ["-tl", "-t", DEFAULT_TEMPLATES_DIR, "-id", normalized, "-duc"],
+            validate_timeout(timeout_seconds),
+            {"operation": "find-template", "template_id": normalized},
         )
-    
-    @mcp.tool()
+
+    @mcp.tool(title="Nuclei Scan By Template ID")
     def run_scan_by_template_id(
         target: str,
         template_id: str,
-        templates_dir: str = "",
         timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
     ) -> dict[str, Any]:
-        target = validate_target(target)
-        timeout_seconds = validate_timeout(timeout_seconds)
-
-        return run_scan_by_template_id_sync(
-            target=target,
-            template_id=template_id,
-            templates_dir=templates_dir,
-            timeout_seconds=timeout_seconds,
+        normalized_target = validate_target(target)
+        normalized_id = validate_template_id(template_id)
+        arguments = base_scan_arguments(normalized_target)
+        arguments.extend(["-id", normalized_id])
+        return command_plan(
+            arguments,
+            validate_timeout(timeout_seconds),
+            {"operation": "scan-by-template-id", "target": normalized_target, "template_id": normalized_id},
         )
-    

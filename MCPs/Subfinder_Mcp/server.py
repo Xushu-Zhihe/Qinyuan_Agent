@@ -1,344 +1,131 @@
-import shutil
-import subprocess
-from typing import Any
-import json
+from __future__ import annotations
+
 import os
-import tempfile
+import re
+from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-# 创建 MCP 服务对象。
-# json_response=True 表示工具返回结果时尽量使用 JSON 格式，方便客户端解析。
-mcp = FastMCP("subfinder-mcp-server", json_response=True)
 
-
-@mcp.tool(
-    title="Check Subfinder",
-    description=(
-        "Check whether subfinder is installed and available in PATH. "
-        "Returns the executable path and version/help output. "
+mcp = FastMCP(
+    "qinyuan-subfinder-command-planner",
+    instructions=(
+        "Validate authorized subdomain-enumeration requests and return "
+        "sandbox_command objects. This server never executes Subfinder."
     ),
+    json_response=True,
 )
-def check_subfinder() -> dict[str, Any]:
-    """
-    检查本机是否已经安装 subfinder。
 
-    1. shutil.which("subfinder") 会在系统 PATH 环境变量中查找 subfinder 命令。
-    2. 如果找不到，说明没有安装，或者安装了但没有配置到 PATH。
-    3. 如果找到了，再执行 subfinder -version,用于确认命令可以正常运行。
-    """
+_DOMAIN_PATTERN = re.compile(
+    r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+    re.IGNORECASE,
+)
 
-    # 在系统 PATH 中查找 subfinder 的可执行文件路径。
-    subfinder_path = shutil.which("subfinder")
 
-    # 找不到 subfinder 时，直接返回失败信息，不继续执行命令。
-    if not subfinder_path:
-        return {
-            "ok": False,
-            "installed": False,
-            "message": "subfinder is not installed or not present in PATH",
-        }
-
-    # 执行 subfinder -version，获取版本信息。
-    completed = subprocess.run(
-        [subfinder_path, "-version"],
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=False,
+def _allowed_domain_rules() -> tuple[str, ...]:
+    raw = os.getenv(
+        "MCP_SUBFINDER_ALLOWED_DOMAINS",
+        "localhost,target-web",
     )
+    rules = tuple(item.strip().lower().rstrip(".") for item in raw.split(",") if item.strip())
+    if not rules:
+        raise RuntimeError("MCP_SUBFINDER_ALLOWED_DOMAINS cannot be empty")
+    return rules
 
+
+def _validate_domain(domain: str) -> str:
+    candidate = domain.strip().lower().rstrip(".")
+    if not candidate or candidate.startswith("-"):
+        raise ValueError("domain must be a non-empty DNS name")
+
+    # Docker Compose service names such as target-web have no dot.
+    if candidate != "localhost" and not _DOMAIN_PATTERN.fullmatch(candidate):
+        if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", candidate):
+            raise ValueError("domain must be one hostname or root domain")
+
+    allowed = any(
+        candidate == rule
+        or (rule.startswith("*.") and candidate.endswith(rule[1:]))
+        for rule in _allowed_domain_rules()
+    )
+    if not allowed:
+        raise PermissionError(f"domain {candidate!r} is not authorized")
+    return candidate
+
+
+def _validate_timeout(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 5 <= value <= 300:
+        raise ValueError("timeout_seconds must be an integer between 5 and 300")
+    return value
+
+
+def _plan(arguments: list[str], timeout_seconds: int, request: dict[str, Any]) -> dict[str, Any]:
     return {
-        "ok": True,
-        "installed": True,
-        "path": subfinder_path,
-        "returncode": completed.returncode,
-        "stdout": completed.stdout,
-        "stderr": completed.stderr,
+        "sandbox_command": {
+            "tool": "subfinder",
+            "arguments": arguments,
+            "timeout_seconds": _validate_timeout(timeout_seconds),
+        },
+        "request": request,
     }
 
 
-@mcp.tool(
-    title="Subfinder Domain Scan",
-    description=(
-        "Run subfinder against a single domain to discover subdomains. "
-        "Input domain should be a root such as example.com. "
-        "The tool runs subfinder in silent mode and returns discovered subdomains. "
-    ),
-)
+@mcp.tool(title="Subfinder Version")
+def check_subfinder(timeout_seconds: int = 15) -> dict[str, Any]:
+    """Prepare a version check inside the current Agent sandbox."""
+    return _plan(["-version"], timeout_seconds, {"operation": "version"})
+
+
+@mcp.tool(title="Subfinder Domain Scan")
 def run_subfinder_scan(
     domain: str,
     timeout_seconds: int = 120,
 ) -> dict[str, Any]:
-    """
-    扫描单个根域名的子域名。
-
-    参数说明：
-    domain:要扫描的根域名,例如 example.com。
-    timeout_seconds:命令最大运行时间,默认 120 秒。
-
-    本函数调用的是 subfinder -d domain -silent。
-    -d 表示指定单个域名。
-    -silent 表示只输出发现结果，减少无关日志。
-    """
-
-    # 每次执行前都重新查找 subfinder，避免路径变化后仍使用旧路径。
-    subfinder_path = shutil.which("subfinder")
-
-    if not subfinder_path:
-        raise RuntimeError("subfinder is not installed or present in PATH")
-
-    # 拼接要执行的命令。这里使用列表形式，比直接拼字符串更安全。
-    command = [
-        subfinder_path,
-        "-d",
-        domain,
-        "-silent",
-    ]
-
-    try:
-        completed = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        return {
-            "ok": False,
-            "domain": domain,
-            "timeout": True,
-            "command": command,
-        }
-
-    # subfinder 的输出通常是一行一个子域名。
-    subdomains = []
-    lines = completed.stdout.splitlines()
-
-    for i in range(len(lines)):
-        line = lines[i].strip()
-        if line != "":
-            subdomains.append(line)
-
-    return {
-        "ok": completed.returncode == 0,
-        "domain": domain,
-        "count": len(subdomains),
-        "subdomains": subdomains,
-        "returncode": completed.returncode,
-        "stdout": completed.stdout,
-        "stderr": completed.stderr,
-        "command": command,
-    }
+    normalized = _validate_domain(domain)
+    return _plan(
+        ["-d", normalized, "-silent"],
+        timeout_seconds,
+        {"operation": "enumerate", "domains": [normalized], "format": "text"},
+    )
 
 
-@mcp.tool(
-    title="Subfinder JSON Domain Scan",
-    description=(
-        "Run subfinder against a single domain and return JSON output. "
-        "Input domain should be a root domain such as example.com. "
-        "The tool runs subfinder with -oJ to get structured JSON lines."
-    ),
-)
+@mcp.tool(title="Subfinder JSON Domain Scan")
 def run_subfinder_json_scan(
     domain: str,
     timeout_seconds: int = 120,
 ) -> dict[str, Any]:
-    """
-    使用 JSON 格式扫描单个域名的子域名。
-
-    1. 普通扫描只返回文本行。
-    2. JSON 扫描使用 -oJ,每一行都是一个 JSON 对象。
-    3. 解析 JSON 后，可以从 host 字段中提取子域名。
-    """
-
-    subfinder_path = shutil.which("subfinder")
-
-    if not subfinder_path:
-        raise RuntimeError("subfinder is not installed or present in PATH")
-
-    # -oJ 表示输出 JSON Lines 格式。
-    command = [
-        subfinder_path,
-        "-d",
-        domain,
-        "-oJ",
-        "-silent",
-    ]
-
-    try:
-        completed = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        return {
-            "ok": False,
-            "domain": domain,
-            "timeout": True,
-            "command": command,
-        }
-
-    # json_results 保存完整 JSON 结果，subdomains 只保存提取出来的 host。
-    json_results = []
-    subdomains = []
-
-    lines = completed.stdout.splitlines()
-
-    for i in range(len(lines)):
-        line = lines[i].strip()
-
-        if line != "":
-            try:
-                data = json.loads(line)
-                json_results.append(data)
-
-                if "host" in data:
-                    subdomains.append(data["host"])
-            except json.JSONDecodeError:
-                json_results.append(
-                    {
-                        "raw": line,
-                        "parse_error": True,
-                    }
-                )
-
-    return {
-        "ok": completed.returncode == 0,
-        "domain": domain,
-        "count": len(subdomains),
-        "subdomains": subdomains,
-        "json_results": json_results,
-        "returncode": completed.returncode,
-        "stdout": completed.stdout,
-        "stderr": completed.stderr,
-        "command": command,
-    }
+    normalized = _validate_domain(domain)
+    return _plan(
+        ["-d", normalized, "-silent", "-oJ"],
+        timeout_seconds,
+        {"operation": "enumerate", "domains": [normalized], "format": "jsonl"},
+    )
 
 
-@mcp.tool(
-    title="Subfinder Batch Domain Scan",
-    description=(
-        "Run subfinder against multiple domains. "
-        "Input domains should be a list of root domains such as ['example.com', 'test.com']. "
-        "The tool writes domains to a temporary file, runs subfinder with -dL, "
-        "and returns discovered subdomains."
-    ),
-)
+@mcp.tool(title="Subfinder Batch Domain Scan")
 def run_subfinder_batch_scan(
     domains: list[str],
     timeout_seconds: int = 180,
 ) -> dict[str, Any]:
-    """
-    批量扫描多个域名的子域名。
+    if not isinstance(domains, list) or not 1 <= len(domains) <= 50:
+        raise ValueError("domains must contain between 1 and 50 items")
 
-    参数说明：
-    domains:域名列表,例如 ["example.com", "test.com"]。
-    timeout_seconds:命令最大运行时间,默认 180 秒。
+    normalized = list(dict.fromkeys(_validate_domain(item) for item in domains))
+    arguments: list[str] = ["-silent", "-oJ"]
+    for domain in normalized:
+        arguments.extend(["-d", domain])
 
-    subfinder 批量扫描需要使用 -dL 参数。
-    -dL 后面跟一个文本文件路径，文件中一行一个根域名。
-    所以这里会先创建临时文件，把 domains 写进去，再交给 subfinder 扫描。
-    """
-
-    subfinder_path = shutil.which("subfinder")
-
-    if not subfinder_path:
-        raise RuntimeError("subfinder is not installed or present in PATH")
-
-    # 清洗输入列表：去掉空格和空字符串，避免写入无效域名。
-    clean_domains = []
-
-    for i in range(len(domains)):
-        domain = domains[i].strip()
-        if domain != "":
-            clean_domains.append(domain)
-
-    if len(clean_domains) == 0:
-        return {
-            "ok": False,
-            "message": "domains list is empty",
-            "domains": domains,
-        }
-
-    # 用来保存临时文件路径，finally 中需要根据它删除临时文件。
-    temp_file_path = ""
-
-    try:
-        # 创建一个临时 txt 文件，用来存放待扫描域名。
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            delete=False,
-            suffix=".txt",
-            encoding="utf-8",
-        ) as temp_file:
-            temp_file_path = temp_file.name
-
-            # 一行写入一个域名，这是 subfinder -dL 需要的格式。
-            for i in range(len(clean_domains)):
-                temp_file.write(clean_domains[i] + "\n")
-
-        command = [
-            subfinder_path,
-            "-dL",
-            temp_file_path,
-            "-silent",
-        ]
-
-        completed = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-            check=False,
-        )
-
-        subdomains = []
-        lines = completed.stdout.splitlines()
-
-        for i in range(len(lines)):
-
-            line = lines[i].strip()
-            if line != "":
-                subdomains.append(line)
-
-        return {
-            "ok": completed.returncode == 0,
-            "domains": clean_domains,
-            "domain_count": len(clean_domains),
-            "count": len(subdomains),
-            "subdomains": subdomains,
-            "returncode": completed.returncode,
-            "stdout": completed.stdout,
-            "stderr": completed.stderr,
-            "command": command,
-        }
-
-    except subprocess.TimeoutExpired:
-        return {
-            "ok": False,
-            "domains": clean_domains,
-            "timeout": True,
-            "timeout_seconds": timeout_seconds,
-        }
-
-    finally:
-        # 无论扫描成功、失败还是超时，都删除临时文件。
-        if temp_file_path != "" and os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
+    return _plan(
+        arguments,
+        timeout_seconds,
+        {"operation": "enumerate", "domains": normalized, "format": "jsonl"},
+    )
 
 
 def main() -> None:
-    """
-    MCP 服务启动入口。
+    mcp.run(transport="stdio")
 
-    当直接运行 uv run server.py 时，会执行 main()，从而启动 MCP 服务。
-    """
-    mcp.run()
 
 if __name__ == "__main__":
     main()

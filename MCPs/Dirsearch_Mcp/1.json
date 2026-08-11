@@ -1,13 +1,8 @@
 {
   "mcpServers": {
-    "dirsearch-mcp": {
-      "command": "uv",
-      "args": [
-        "--directory",
-        "你的 Dirsearch_Mcp 目录",
-        "run",
-        "src/server.py"
-      ]
+    "dirsearch": {
+      "command": "python",
+      "args": ["-m", "src.server"]
     }
   }
 }
