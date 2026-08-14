@@ -1,12 +1,54 @@
 from __future__ import annotations
 
-from dataclasses import dataclass,field
+import os
+import re
+from dataclasses import dataclass, field
+
+
+DEFAULT_ALLOWED_TOOLS = frozenset(
+    {
+        "nmap",
+        "curl",
+        "subfinder",
+        "amass",
+        "httpx",
+        "ffuf",
+        "dirsearch",
+        "nuclei",
+        "pwsh",
+    }
+)
+_TOOL_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+-]*")
+
+
+def _configured_tools() -> frozenset[str]:
+    raw = os.environ.get("QINYUAN_SANDBOX_ALLOWED_TOOLS")
+    if raw is None:
+        return DEFAULT_ALLOWED_TOOLS
+    values = frozenset(item.strip() for item in raw.split(",") if item.strip())
+    if not values:
+        raise ValueError("QINYUAN_SANDBOX_ALLOWED_TOOLS must not be empty")
+    return values
+
+
+def _configured_boolean(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean")
+
 
 @dataclass(frozen=True)
 class SandboxSettings:
-    image: str = "qinyuan/pentest-sandbox:0.2.0"
+    image: str = "qinyuan/pentest-sandbox:0.3.1"
     network: str = "qinyuan_pentest_lab"
-    
+    network_internal: bool = True
+
     memory_limit: str = "512m"
     memory_swap_limit: str = "512m"
     cpu_limit: int = 500_000_000
@@ -26,23 +68,43 @@ class SandboxSettings:
     # 每个 stdout/stderr 最多在宿主机内存中保留 128 KiB。
     maximum_output_bytes_per_stream: int = 128 * 1024
 
-    allowed_tools: frozenset[str] = field(
-        default_factory = lambda: frozenset(
-            {
-                "nmap",
-                "curl",
-                "subfinder",
-                "amass",
-                "httpx",
-                "ffuf",
-                "dirsearch",
-                "nuclei",
-            }
+    allowed_tools: frozenset[str] = field(default_factory=lambda: DEFAULT_ALLOWED_TOOLS)
+
+    @classmethod
+    def from_environment(cls) -> "SandboxSettings":
+        return cls(
+            image=os.environ.get(
+                "QINYUAN_SANDBOX_IMAGE",
+                "qinyuan/pentest-sandbox:0.3.1",
+            ).strip(),
+            network=os.environ.get(
+                "QINYUAN_SANDBOX_NETWORK",
+                "qinyuan_pentest_lab",
+            ).strip(),
+            network_internal=_configured_boolean(
+                "QINYUAN_SANDBOX_NETWORK_INTERNAL",
+                True,
+            ),
+            allowed_tools=_configured_tools(),
         )
-    )
 
     def __post_init__(self) -> None:
         """在程序启动阶段发现错误配置。"""
+
+        if not self.image:
+            raise ValueError("sandbox image must not be empty")
+
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", self.network):
+            raise ValueError("sandbox network name is invalid")
+
+        if not isinstance(self.network_internal, bool):
+            raise ValueError("network_internal must be a boolean")
+
+        if not self.allowed_tools or any(
+            _TOOL_NAME_PATTERN.fullmatch(tool) is None
+            for tool in self.allowed_tools
+        ):
+            raise ValueError("allowed sandbox tools must be command names")
 
         if self.maximum_timeout_seconds < 1:
             raise ValueError("maximum_timeout_seconds must be positive")

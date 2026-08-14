@@ -2,26 +2,26 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from Sandbox.models import CommandRequest, CommandResult
+from Sandbox.models import CommandRequest, CommandResult, SandboxMounts
+
 
 class SandboxRuntime(Protocol):
-    def create(self,agent_id: str) -> str:
-        """创建沙盒并返回 sandbox_id."""
+    def create(self, agent_id: str, mounts: SandboxMounts) -> str:
+        """Create a sandbox and return its identifier."""
         ...
-        
+
     def execute(
         self,
         sandbox_id: str,
         request: CommandRequest,
     ) -> CommandResult:
-        """在指定沙盒中执行命令."""
+        """Execute one command inside a sandbox."""
         ...
-    
-    def destroy(self,sandbox_id: str) -> None:
-        """销毁指定沙盒."""
+
+    def destroy(self, sandbox_id: str) -> None:
+        """Destroy one sandbox."""
         ...
-    
+
     def close(self) -> None:
-        """释放 Runtime 使用的资源."""
+        """Release resources held by the runtime."""
         ...
-    

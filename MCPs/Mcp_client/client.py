@@ -3,7 +3,9 @@ from __future__ import annotations
 import sys
 import asyncio
 import json
+import os
 import threading
+import time
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -190,6 +192,31 @@ def _string_list(item:dict[str,Any], field_name:str) -> list[str]:
 
     return value
 
+
+def select_registry_servers(
+    registry: MCPRegistryConfig,
+    allowed_servers: Iterable[str] | None,
+) -> MCPRegistryConfig:
+    """Restrict the registry without enabling unknown or disabled servers."""
+
+    if allowed_servers is None:
+        return registry
+    requested = frozenset(item.strip() for item in allowed_servers if item.strip())
+    if not requested:
+        raise ValueError("MCP server allowlist must not be empty")
+    unknown = requested.difference(registry.servers)
+    if unknown:
+        raise ValueError(f"unknown MCP servers: {sorted(unknown)}")
+    disabled = {
+        name for name in requested if not registry.servers[name].enabled
+    }
+    if disabled:
+        raise ValueError(f"disabled MCP servers cannot be enabled: {sorted(disabled)}")
+    return MCPRegistryConfig(
+        servers={name: registry.servers[name] for name in sorted(requested)}
+    )
+
+
 class MCPManager:
     """
     MCP 总管：
@@ -207,6 +234,7 @@ class MCPManager:
         *,
         mcp_call_timeout_seconds: float = 10.0,
         output_character_limit: int = 20_000,
+        audit_path: str | Path | None = None,
     ) -> None:
         if mcp_call_timeout_seconds <= 0:
             raise ValueError("mcp_call_timeout_seconds must be positive")
@@ -218,12 +246,32 @@ class MCPManager:
         self.sandbox_service = sandbox_service
         self.mcp_call_timeout_seconds = mcp_call_timeout_seconds
         self.output_character_limit = output_character_limit
+        self.audit_path = Path(audit_path).resolve() if audit_path is not None else None
 
         self.runtimes: dict[str, MCPServerRuntime] = {}
         self.tool_index: dict[str, MCPToolMeta] = {}
 
         self._event_loop: asyncio.AbstractEventLoop | None = None
         self._event_loop_thread_id: int | None = None
+        self._audit_lock = asyncio.Lock()
+
+    @staticmethod
+    def _append_audit_line(path: Path, payload: dict[str, Any]) -> None:
+        with path.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+            handle.write("\n")
+            handle.flush()
+
+    async def _write_audit(self, payload: dict[str, Any]) -> None:
+        if self.audit_path is None:
+            return
+        record = {"timestamp": time.time(), **payload}
+        async with self._audit_lock:
+            await asyncio.to_thread(
+                self._append_audit_line,
+                self.audit_path,
+                record,
+            )
 
     async def start_all(self) -> None:
         """启动注册表中所有 enabled = true的 MCP Server"""
@@ -266,10 +314,14 @@ class MCPManager:
                 if command == "{python}":
                     command = sys.executable
 
+                environment = {
+                    key: os.environ.get(key, value)
+                    for key, value in config.env.items()
+                }
                 parameters = StdioServerParameters(
                     command=command,
                     args=list(config.args),
-                    env=config.env,
+                    env=environment,
                     cwd=config.cwd,
                 )
 
@@ -447,11 +499,31 @@ class MCPManager:
                 f"request executable {request.tool!r}"
             )
 
-        result = await asyncio.to_thread(
-            self.sandbox_service.execute,
-            agent_id,
-            request,
-        )
+        audit_base = {
+            "agent_id": agent_id,
+            "tool": qualified_name,
+            "tool_arguments": arguments,
+            "executable": request.tool,
+            "arguments": list(request.arguments),
+            "timeout_seconds": request.timeout_seconds,
+        }
+        await self._write_audit({"event": "started", **audit_base})
+        try:
+            result = await asyncio.to_thread(
+                self.sandbox_service.execute,
+                agent_id,
+                request,
+            )
+        except Exception as exc:
+            await self._write_audit(
+                {
+                    "event": "failed",
+                    **audit_base,
+                    "error": type(exc).__name__,
+                    "message": str(exc),
+                }
+            )
+            raise
 
         # stdout,stdout_truncated = self._truncate_output(result.stdout)
         # stderr,stderr_truncated = self._truncate_output(result.stderr)
@@ -479,7 +551,7 @@ class MCPManager:
         else:
             status = "failed"
 
-        return MCPExecutionResult(
+        execution_result = MCPExecutionResult(
             agent_id=agent_id,
             sandbox_id=result.sandbox_id,
             qualified_name=qualified_name,
@@ -493,6 +565,19 @@ class MCPManager:
             stdout_truncated=stdout_truncated,
             stderr_truncated=stderr_truncated,
         )
+        await self._write_audit(
+            {
+                "event": "finished",
+                **audit_base,
+                "sandbox_id": result.sandbox_id,
+                "status": status,
+                "exit_code": result.exit_code,
+                "timed_out": result.timed_out,
+                "stdout_truncated": stdout_truncated,
+                "stderr_truncated": stderr_truncated,
+            }
+        )
+        return execution_result
 
     def _execute_bound_tool_sync(
         self,
@@ -686,13 +771,20 @@ class AgentMCPClient:
 async def build_mcp_runtime(
     sandbox_service: SandboxService,
     registry_path: str | Path | None = None,
+    *,
+    allowed_servers: Iterable[str] | None = None,
+    audit_path: str | Path | None = None,
 ) -> MCPManager:
     if registry_path is None:
         registry_path = Path(__file__).with_name("registry.json")
 
     manager = MCPManager(
-        registry=load_registry(registry_path),
+        registry=select_registry_servers(
+            load_registry(registry_path),
+            allowed_servers,
+        ),
         sandbox_service=sandbox_service,
+        audit_path=audit_path,
     )
 
     await manager.start_all()

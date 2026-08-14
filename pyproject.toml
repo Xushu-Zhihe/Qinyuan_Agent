@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "qinyuan-agent"
 version = "0.1.0"
@@ -6,10 +10,21 @@ dependencies = [
     "docker>=7.1,<8",
     "langchain-core>=0.3,<2",
     "langchain-openai>=0.3,<2",
-    "mcp[cli]>=1.9.0",
+    "mcp[cli]>=1.9,<2",
     "pydantic>=2.7,<3",
     "python-dotenv>=1,<2",
 ]
 
+[project.scripts]
+qinyuan-agent = "agent:main"
+
+[tool.setuptools]
+include-package-data = true
+py-modules = ["agent"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["Agents*", "LLMs*", "MCPs*", "Sandbox*", "Tools*"]
+
 [tool.uv]
-package = false
+package = true

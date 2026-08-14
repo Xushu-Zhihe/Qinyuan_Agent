@@ -15,6 +15,9 @@ from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
 # ============================================================
 # 1. SkillAgentFactory（现场编译子Agent）
 # ============================================================
@@ -152,7 +155,7 @@ class ToolCallingAgentRunner:
         """
         异步执行 Agent。
 
-        Orchestrator 应优先使用这个入口，这样多个 Worker 可以并发运行，
+        调用方应优先使用这个入口，这样多个 subagent 可以并发运行，
         并直接调用 StructuredTool 的异步 coroutine。
         """
 
@@ -230,8 +233,10 @@ class SkillAgentFactory:
         self.tool_registry = tool_registry or {}
     
     def load_skill_md(self, skill_name: str) -> str:
-        path = Path("Skills") / skill_name / "SKILL.md"
-        if not path.exists():
+        if not skill_name or Path(skill_name).name != skill_name:
+            raise ValueError("skill_name must be a directory name")
+        path = PROJECT_ROOT / "Skills" / skill_name / "SKILL.md"
+        if not path.is_file():
             raise FileNotFoundError(f"Skill '{skill_name}' not found: {path}")
         return path.read_text(encoding="utf-8")
 
@@ -245,8 +250,7 @@ class SkillAgentFactory:
         """
         直接根据系统提示词创建 Agent。
 
-        BlackboardWorker 使用这个入口，因此暂时不必额外创建大量
-        SKILL.md 文件。
+        当前 CLI 使用这个入口，因此暂时不必额外创建大量 SKILL.md 文件。
         """
 
         if not system_prompt.strip():
@@ -284,47 +288,6 @@ class SkillAgentFactory:
             tools=tools,
             max_steps=max_steps,
         )
-
-        def _run(input_data: str) -> str:
-            messages = [
-                SystemMessage(content=skill_md),
-                HumanMessage(content=input_data),
-            ]
-            
-            for _ in range(max_steps):
-                response = llm_with_tools.invoke(messages)
-                messages.append(response)
-                
-                # 没有 tool_calls，说明已给出最终答案
-                if not response.tool_calls:
-                    return response.content
-                
-                # 执行工具，结果包成 ToolMessage 塞回
-                for tc in response.tool_calls:
-                    tname = tc["name"]
-                    targs = tc["args"]
-                    tid = tc["id"]
-                    
-                    if tname not in tools_map:
-                        result = f"Error: unknown tool '{tname}'"
-                    else:
-                        result = tools_map[tname].invoke(targs)
-                    
-                    messages.append(ToolMessage(content=str(result), tool_call_id=tid))
-            
-            return "Error: max steps reached"
-        
-        # 包装成和 AgentExecutor 接口兼容的对象
-        class _Runner:
-            def __init__(self, fn):
-                self._fn = fn
-            def run(self, input_data: str) -> str:
-                return self._fn(input_data)
-            def invoke(self, inputs: dict) -> dict:
-                inp = inputs.get("input", inputs)
-                return {"output": self._fn(inp)}
-        
-        return _Runner(_run)
 
 
 # ============================================================

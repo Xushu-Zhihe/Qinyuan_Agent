@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import re
 import uuid
+from contextlib import suppress
 
 import docker
 from docker.errors import APIError, ImageNotFound, NotFound
 
-from Sandbox.models import CommandRequest, CommandResult
+from Sandbox.models import CommandRequest, CommandResult, SandboxMounts
 from Sandbox.settings import SandboxSettings
 
 class DockerRuntimeError(RuntimeError):
@@ -43,7 +44,7 @@ class DockerRuntime:
             client.api.timeout = self.settings.docker_api_timeout_seconds
 
             self.client = client
-            self._ensure_internal_network()
+            self._ensure_network()
 
         except DockerRuntimeError:
             if client is not None:
@@ -64,48 +65,71 @@ class DockerRuntime:
                 "Cannot connect to Docker."
             ) from error
 
-    def create(self,agent_id: str) -> str:
+    def create(self, agent_id: str, mounts: SandboxMounts) -> str:
         self._ensure_image_exists()
 
         normalized_agent_id = self._normalize_agent_id(agent_id)
         unique_id = uuid.uuid4().hex[:12]
         container_name = f"qinyuan-{normalized_agent_id}-{unique_id}"
+        tmpfs = {
+            "/tmp": (
+                "rw,noexec,nosuid,nodev,"
+                f"size={self.settings.temporary_size},"
+                "mode=1777"
+            ),
+        }
+        volumes: dict[str, dict[str, str]] = {}
+        working_dir = "/workspace"
 
+        if mounts.work_dir is None:
+            tmpfs["/workspace"] = (
+                "rw,noexec,nosuid,nodev,"
+                f"size={self.settings.workspace_size},"
+                "uid=10001,gid=10001,mode=0700"
+            )
+        else:
+            volumes[str(mounts.work_dir)] = {"bind": "/work", "mode": "rw"}
+            working_dir = "/work"
+
+        if mounts.challenge_dir is not None:
+            volumes[str(mounts.challenge_dir)] = {
+                "bind": "/challenge",
+                "mode": "ro",
+            }
+
+        container = None
         try:
             container = self.client.containers.run(
                 image=self.settings.image,
                 name=container_name,
-                command=["sleep","infinity"],
+                command=["sleep", "infinity"],
                 detach=True,
                 auto_remove=False,
                 network=self.settings.network,
                 read_only=True,
-                tmpfs={
-                    "/tmp":(
-                        "rw,noexec,nosuid,nodev,"
-                        f"size={self.settings.temporary_size},"
-                        "mode=1777"
-                    ),
-                    "/workspace":(
-                        "rw,noexec,nosuid,nodev,"
-                        f"size={self.settings.workspace_size},"
-                        "uid=10001,gid=10001,mode=0700"
-                    ),
+                tmpfs=tmpfs,
+                volumes=volumes or None,
+                cap_drop=["ALL"],
+                security_opt=["no-new-privileges:true"],
+                mem_limit=self.settings.memory_limit,
+                memswap_limit=self.settings.memory_swap_limit,
+                nano_cpus=self.settings.cpu_limit,
+                pids_limit=self.settings.process_limit,
+                user="10001:10001",
+                working_dir=working_dir,
+                environment={
+                    "HOME": "/tmp/qinyuan-home",
+                    "XDG_CACHE_HOME": "/tmp/qinyuan-cache",
+                    "XDG_CONFIG_HOME": "/tmp/qinyuan-config",
+                    "DOTNET_CLI_HOME": "/tmp/qinyuan-dotnet",
+                    "POWERSHELL_TELEMETRY_OPTOUT": "1",
                 },
-            cap_drop=["ALL"],
-            security_opt=["no-new-privileges:true"],
-            mem_limit=self.settings.memory_limit,
-            memswap_limit=self.settings.memory_swap_limit,
-            nano_cpus=self.settings.cpu_limit,
-            pids_limit=self.settings.process_limit,
-            user="10001:10001",
-            working_dir="/workspace",
-            labels={
-                "qinyuan.managed": "true",
-                "qinyuan.component": "sandbox",
-                "qinyuan.agent_id": agent_id,
-            },
-        )
+                labels={
+                    "qinyuan.managed": "true",
+                    "qinyuan.component": "sandbox",
+                    "qinyuan.agent_id": agent_id,
+                },
+            )
 
             container.reload()
 
@@ -127,9 +151,19 @@ class DockerRuntime:
         except DockerRuntimeError:
             raise
         except APIError as error:
+            if container is not None:
+                with suppress(Exception):
+                    container.remove(force=True)
             raise DockerRuntimeError(
                 f"Failed to create sandbox for agent {agent_id!r}:"
                 f"{error.explanation}"
+            ) from error
+        except Exception as error:
+            if container is not None:
+                with suppress(Exception):
+                    container.remove(force=True)
+            raise DockerRuntimeError(
+                f"Failed to initialize sandbox for agent {agent_id!r}"
             ) from error
 
     def execute(
@@ -169,6 +203,10 @@ class DockerRuntime:
 
         try:
             # 使用 Docker 低级 API，是为了流式读取 stdout/stderr。
+            configured_workdir = (
+                (container.attrs.get("Config") or {}).get("WorkingDir")
+                or "/workspace"
+            )
             execution = self.client.api.exec_create(
                 container=container.id,
                 cmd=command,
@@ -178,7 +216,7 @@ class DockerRuntime:
                 tty=False,
                 privileged=False,
                 user="10001:10001",
-                workdir="/workspace",
+                workdir=configured_workdir,
             )
 
             exec_id = execution.get("Id")
@@ -273,6 +311,38 @@ class DockerRuntime:
                 f"{error.explanation}"
             ) from error
 
+    def cleanup_agent_containers(self, agent_id: str) -> tuple[str, ...]:
+        """Remove containers owned by one stable Agent execution identity."""
+
+        normalized_agent_id = agent_id.strip()
+        if not normalized_agent_id:
+            raise ValueError("agent_id cannot be empty")
+        try:
+            containers = self.client.containers.list(
+                all=True,
+                filters={
+                    "label": [
+                        "qinyuan.managed=true",
+                        "qinyuan.component=sandbox",
+                        f"qinyuan.agent_id={normalized_agent_id}",
+                    ]
+                },
+            )
+            removed: list[str] = []
+            for container in containers:
+                container_id = str(container.id)
+                try:
+                    container.remove(force=True)
+                except NotFound:
+                    continue
+                removed.append(container_id)
+            return tuple(removed)
+        except APIError as error:
+            raise DockerRuntimeError(
+                f"Failed to clean stale sandboxes for agent {normalized_agent_id!r}: "
+                f"{error.explanation}"
+            ) from error
+
     def close(self) -> None:
         """
         关闭 Docker SDK客户端连接
@@ -283,14 +353,12 @@ class DockerRuntime:
         """
         self.client.close()
 
-    def _ensure_internal_network(self) -> None:
+    def _ensure_network(self) -> None:
         """
-        创建或检查 Docker内部网络
+        创建或检查 Docker 网络。
 
-        internal=True的作用：
-        - 沙盒之间可以通过该网络同学
-        - 沙盒可以访问同网络中的靶场容器
-        - 默认不能通过该网络访问外部互联网
+        默认 internal=True。公网授权靶场必须显式配置独立的非 internal
+        网络，避免无意中改变既有隔离网络的安全属性。
 
         目标靶场容器后续也需要加入该网络
         """
@@ -305,7 +373,7 @@ class DockerRuntime:
                 network = self.client.networks.create(
                     name=self.settings.network,
                     driver="bridge",
-                    internal=True,
+                    internal=self.settings.network_internal,
                     check_duplicate=True,
                     labels={
                         "qinyuan.managed":"true",
@@ -327,10 +395,12 @@ class DockerRuntime:
 
         network.reload()
 
-        if not network.attrs.get("Internal",False):
+        actual_internal = bool(network.attrs.get("Internal", False))
+        if actual_internal != self.settings.network_internal:
             raise DockerRuntimeError(
-                f"Docker network {self.settings.network!r} exists"
-                "but is not configured as an internal network"
+                f"Docker network {self.settings.network!r} internal setting "
+                f"is {actual_internal}, expected "
+                f"{self.settings.network_internal}"
             )
 
     def _ensure_image_exists(self) -> None:

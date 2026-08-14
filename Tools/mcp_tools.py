@@ -11,7 +11,7 @@ from MCPs.Mcp_client import AgentMCPClient, MCPManager
 
 NMAP_QUALIFIED_NAME = "nmap.run_nmap_tcp_scan"
 
-# 保留已经使用过的 Nmap LangChain Tool 名称，避免破坏现有 Worker Prompt。
+# 保留已经使用过的 Nmap LangChain Tool 名称，避免破坏现有调用方。
 _PUBLIC_NAME_OVERRIDES = {
     NMAP_QUALIFIED_NAME: "nmap_tcp_scan",
 }

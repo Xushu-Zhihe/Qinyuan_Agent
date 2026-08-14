@@ -1,6 +1,9 @@
-# syntax=docker/dockerfile:1.7
-
 ARG NUCLEI_VERSION=v3.4.10
+
+# Pin the working PowerShell 7.5.0 filesystem. A floating stage tag can leave
+# pwsh and System.Management.Automation.dll from different upstream revisions
+# when Docker reuses only part of the multi-stage cache.
+FROM mcr.microsoft.com/powershell@sha256:7ab5bd5ca6f95a3351fa0c6a1205237d57048c94542355aab55519a0861a9b25 AS powershell-tool
 
 FROM golang:1.26-bookworm AS security-tools-builder
 
@@ -62,37 +65,49 @@ COPY --from=security-tools-builder /out/ffuf /usr/local/bin/ffuf
 COPY --from=security-tools-builder /out/amass /usr/local/bin/amass
 COPY --from=security-tools-builder /nuclei-templates /opt/nuclei-templates
 COPY --from=nuclei-tool /usr/local/bin/nuclei /usr/local/bin/nuclei
+COPY --from=powershell-tool /opt/microsoft/powershell/7 /opt/microsoft/powershell/7
 
 ENV DEBIAN_FRONTEND=noninteractive \
+    DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=false \
     PATH="/opt/dirsearch/bin:${PATH}" \
     NUCLEI_TEMPLATES_DIR=/opt/nuclei-templates \
-    PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+    PS_INSTALL_FOLDER=/opt/microsoft/powershell/7 \
+    PSModuleAnalysisCachePath=/tmp/qinyuan-cache/powershell/ModuleAnalysisCache \
+    POWERSHELL_DISTRIBUTION_CHANNEL=PSDocker-Debian-12 \
+    PIP_INDEX_URL=https://pypi.org/simple \
     PIP_DEFAULT_TIMEOUT=60 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_RETRIES=5
 
-RUN sed -i 's|http://deb.debian.org|http://mirrors.tuna.tsinghua.edu.cn|g' \
-        /etc/apt/sources.list.d/debian.sources \
-    && rm -rf /var/lib/apt/lists/* \
+RUN rm -rf /var/lib/apt/lists/* \
     && apt-get -o Acquire::Retries=5 update \
     && apt-get install --no-install-recommends -y \
         ca-certificates \
         coreutils \
         curl \
+        libicu72 \
+        libssl3 \
         nmap \
         python3 \
         python3-pip \
         python3-venv \
+        zlib1g \
     && rm -rf /var/lib/apt/lists/*
+
+RUN ln -s /opt/microsoft/powershell/7/pwsh /usr/local/bin/pwsh
 
 # 与 APT 分层，PyPI 波动时不必重新安装系统包。固定容易发生兼容问题的
 # 二进制依赖，避免未来的新版本导致 Python 3.11 运行异常。
-RUN python3 -m venv /opt/dirsearch \
-    && (/opt/dirsearch/bin/pip install --no-cache-dir \
+RUN /usr/bin/python3 -m venv --without-pip /opt/dirsearch \
+    && /usr/bin/python3 -m pip install --no-cache-dir --target \
+        "$(/opt/dirsearch/bin/python3 -c \
+            'import sysconfig; print(sysconfig.get_paths()["purelib"])')" \
+        "pip==25.3" \
+    && (/opt/dirsearch/bin/python3 -m pip install --no-cache-dir \
             "cffi==1.17.1" \
             "chardet==5.2.0" \
             "dirsearch==0.4.3.post1" \
-        || /opt/dirsearch/bin/pip install --no-cache-dir \
+        || /opt/dirsearch/bin/python3 -m pip install --no-cache-dir \
             "cffi==1.17.1" \
             "chardet==5.2.0" \
             "dirsearch==0.4.3.post1")
@@ -121,7 +136,8 @@ RUN mkdir -p /opt/qinyuan/wordlists \
     && command -v httpx >/dev/null \
     && command -v ffuf >/dev/null \
     && command -v dirsearch >/dev/null \
-    && command -v nuclei >/dev/null
+    && command -v nuclei >/dev/null \
+    && command -v pwsh >/dev/null
 
 RUN groupadd --gid 10001 sandbox \
     && useradd \
@@ -135,5 +151,10 @@ RUN groupadd --gid 10001 sandbox \
 
 WORKDIR /workspace
 USER 10001:10001
+
+# Validate the same non-root entrypoint used by SandboxService. This catches
+# an inconsistent copied PowerShell runtime while the image is being built.
+RUN pwsh -NoLogo -NoProfile -NonInteractive -Command \
+    '$PSVersionTable.PSVersion.ToString()' >/dev/null
 
 CMD ["sleep", "infinity"]

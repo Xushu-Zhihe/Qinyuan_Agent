@@ -7,6 +7,7 @@ from Sandbox.contracts import SandboxRuntime
 from Sandbox.models import (
     CommandRequest,
     CommandResult,
+    SandboxMounts,
     SandboxSession,
     SandboxStatus,
 )
@@ -43,7 +44,11 @@ class SandboxService:
         self._registry_lock = RLock()
         self._closed = False
 
-    def start_for_agent(self, agent_id: str) -> SandboxSession:
+    def start_for_agent(
+        self,
+        agent_id: str,
+        mounts: SandboxMounts | None = None,
+    ) -> SandboxSession:
         """
         为一个 Agent 创建或获取专属沙盒。
 
@@ -57,6 +62,7 @@ class SandboxService:
 
         if not normalized_agent_id:
             raise SandboxError("agent_id cannot be empty")
+        configured_mounts = mounts or SandboxMounts()
 
         with self._registry_lock:
             if self._closed:
@@ -82,10 +88,14 @@ class SandboxService:
                     existing_session is not None
                     and existing_session.status == SandboxStatus.RUNNING
                 ):
+                    if existing_session.mounts != configured_mounts:
+                        raise SandboxError(
+                            "cannot change mounts for a running sandbox"
+                        )
                     return existing_session
 
             # Docker 创建容器可能较慢，不能持有全局 registry lock。
-            sandbox_id = self.runtime.create(normalized_agent_id)
+            sandbox_id = self.runtime.create(normalized_agent_id, configured_mounts)
 
             try:
                 with self._registry_lock:
@@ -100,6 +110,7 @@ class SandboxService:
                         agent_id=normalized_agent_id,
                         sandbox_id=sandbox_id,
                         status=SandboxStatus.RUNNING,
+                        mounts=configured_mounts,
                     )
 
                     self._sessions[normalized_agent_id] = session

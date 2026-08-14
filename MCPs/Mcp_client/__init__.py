@@ -5,6 +5,7 @@ from .client import (
     MCPManager,
     build_mcp_runtime,
     load_registry,
+    select_registry_servers,
 )
 
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     "MCPManager",
     "build_mcp_runtime",
     "load_registry",
+    "select_registry_servers",
 ]
