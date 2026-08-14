@@ -1,11 +1,15 @@
-def load_builtin_tools() -> None:
-    """Import built-in modules so their tools register once."""
+from .mcp_tools import (
+    NMAP_QUALIFIED_NAME,
+    create_agent_tool_registry,
+    create_agent_tools,
+    create_mcp_structured_tool,
+    create_nmap_mcp_tool,
+)
 
-    from . import powershell as _powershell
-    from . import read_artifact as _read_artifact
-    from . import read_skill as _read_skill
-
-    _ = (_powershell, _read_artifact, _read_skill)
-
-
-__all__ = ["load_builtin_tools"]
+__all__ = [
+    "NMAP_QUALIFIED_NAME",
+    "create_agent_tool_registry",
+    "create_agent_tools",
+    "create_mcp_structured_tool",
+    "create_nmap_mcp_tool",
+]

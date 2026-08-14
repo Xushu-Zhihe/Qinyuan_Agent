@@ -1,9 +1,6 @@
 .vscode
-/.codex-source/
+.env
 __pycache__/
-*.py[cod]
-/.pytest_cache/
+*.pyc
+*.pyo
 *.egg-info/
-*.log
-*.tmp
-/var/

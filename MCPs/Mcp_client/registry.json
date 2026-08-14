@@ -1,0 +1,128 @@
+{
+  "mcpServers": {
+    "nmap": {
+      "transport": "stdio",
+      "command": "{python}",
+      "cwd": "../Nmap_Mcp",
+      "args": ["server.py"],
+      "env": {
+        "MCP_NMAP_ALLOWED_TARGETS": "127.0.0.1,localhost,target-web",
+        "MCP_NMAP_MAX_PORTS": "1024"
+      },
+      "tags": ["network-scan", "reconnaissance"],
+      "sandboxTools": ["nmap"],
+      "enabled": true
+    },
+    "subfinder": {
+      "transport": "stdio",
+      "command": "{python}",
+      "cwd": "../Subfinder_Mcp",
+      "args": ["server.py"],
+      "env": {
+        "MCP_SUBFINDER_ALLOWED_DOMAINS": "localhost,target-web"
+      },
+      "tags": ["subdomain-enumeration", "reconnaissance"],
+      "sandboxTools": ["subfinder"],
+      "enabled": true
+    },
+    "amass": {
+      "transport": "stdio",
+      "command": "{python}",
+      "cwd": "../Amass_Mcp",
+      "args": ["server.py"],
+      "env": {
+        "MCP_AMASS_ALLOWED_DOMAINS": "localhost,target-web"
+      },
+      "tags": ["subdomain-enumeration", "reconnaissance"],
+      "sandboxTools": ["amass"],
+      "enabled": true
+    },
+    "httpx": {
+      "transport": "stdio",
+      "command": "{python}",
+      "cwd": "../Httpx_Mcp",
+      "args": ["server.py"],
+      "env": {
+        "MCP_HTTPX_ALLOWED_HOSTS": "127.0.0.1,localhost,target-web"
+      },
+      "tags": ["http-probe", "reconnaissance"],
+      "sandboxTools": ["httpx"],
+      "enabled": true
+    },
+    "ffuf": {
+      "transport": "stdio",
+      "command": "{python}",
+      "cwd": "../ffuf_mcp",
+      "args": ["server.py"],
+      "env": {
+        "MCP_FFUF_ALLOWED_HOSTS": "127.0.0.1,localhost,target-web"
+      },
+      "tags": ["content-discovery", "web-fuzzing"],
+      "sandboxTools": ["ffuf"],
+      "enabled": true
+    },
+    "dirsearch": {
+      "transport": "stdio",
+      "command": "{python}",
+      "cwd": "../Dirsearch_Mcp",
+      "args": ["-m", "src.server"],
+      "env": {
+        "MCP_DIRSEARCH_ALLOWED_HOSTS": "127.0.0.1,localhost,target-web"
+      },
+      "tags": ["content-discovery", "reconnaissance"],
+      "sandboxTools": ["dirsearch"],
+      "enabled": true
+    },
+    "nuclei": {
+      "transport": "stdio",
+      "command": "{python}",
+      "cwd": "../Nuclei_mcp",
+      "args": ["server.py"],
+      "env": {
+        "MCP_NUCLEI_ALLOWED_TARGETS": "127.0.0.1,localhost,target-web",
+        "NUCLEI_TEMPLATES_DIR": "/opt/nuclei-templates"
+      },
+      "tags": ["vulnerability-scan", "assessment"],
+      "sandboxTools": ["nuclei"],
+      "enabled": true
+    },
+    "web": {
+      "transport": "stdio",
+      "command": "{python}",
+      "cwd": "../Web_Mcp",
+      "args": ["server.py"],
+      "env": {
+        "MCP_WEB_ALLOWED_HOSTS": "127.0.0.1,localhost,target-web"
+      },
+      "tags": ["http-request", "manual-verification"],
+      "sandboxTools": ["curl", "pwsh"],
+      "enabled": true
+    },
+    "burp": {
+      "transport": "stdio",
+      "command": "{python}",
+      "cwd": "../Burp_Suite_Mcp",
+      "args": ["server.py"],
+      "env": {
+        "MCP_BURP_ALLOWED_HOSTS": "127.0.0.1,localhost,target-web",
+        "MCP_BURP_ALLOWED_PROXIES": "http://burp:8080"
+      },
+      "tags": ["http-proxy", "manual-verification"],
+      "sandboxTools": ["curl"],
+      "enabled": false
+    },
+    "zap": {
+      "transport": "stdio",
+      "command": "{python}",
+      "cwd": "../OWASP_ZAP_Mcp",
+      "args": ["server.py"],
+      "env": {
+        "MCP_ZAP_ALLOWED_API_BASES": "http://zap:8080",
+        "MCP_ZAP_ALLOWED_TARGETS": "127.0.0.1,localhost,target-web"
+      },
+      "tags": ["dynamic-analysis", "vulnerability-scan"],
+      "sandboxTools": ["curl"],
+      "enabled": false
+    }
+  }
+}

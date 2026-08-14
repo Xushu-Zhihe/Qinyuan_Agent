@@ -1,0 +1,13 @@
+.git
+.gitignore
+.env
+.env.*
+**/__pycache__
+*.py[cod]
+.venv
+venv
+.uv-cache
+.ruff_cache
+*.egg-info
+node_modules
+Assert
