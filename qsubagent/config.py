@@ -135,13 +135,20 @@ class AppSettings:
         if not api_key_env:
             raise ValueError("model.api_key_env 不能为空")
 
+        configured_api_key = model_raw.get("api_key", "")
+        if not isinstance(configured_api_key, str):
+            raise ValueError("model.api_key must be a string")
+
         mode = execution_mode or str(
             powershell_raw.get("mode", "unrestricted")
         ).strip()
         settings = cls(
             model=ModelSettings(
                 name=str(model_raw.get("name", "")).strip(),
-                api_key=os.environ.get(api_key_env, "").strip(),
+                api_key=(
+                    configured_api_key.strip()
+                    or os.environ.get(api_key_env, "").strip()
+                ),
                 base_url=str(model_raw.get("base_url", "")).strip(),
                 api_key_env=api_key_env,
             ),

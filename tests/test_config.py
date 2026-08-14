@@ -29,6 +29,34 @@ class ConfigTests(unittest.TestCase):
 
             self.assertEqual(settings.model.api_key, "secret")
 
+    def test_api_key_can_come_from_config(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_config(
+                directory,
+                "model:\n"
+                "  name: test\n"
+                "  base_url: ''\n"
+                "  api_key: config-secret\n"
+                "  api_key_env: QSUBAGENT_TEST_KEY\n",
+            )
+            with patch.dict(
+                os.environ,
+                {"QSUBAGENT_TEST_KEY": "environment-secret"},
+            ):
+                settings = AppSettings.load(path)
+
+            self.assertEqual(settings.model.api_key, "config-secret")
+
+    def test_api_key_in_config_must_be_a_string(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_config(
+                directory,
+                "model:\n  name: test\n  api_key: 123\n",
+            )
+
+            with self.assertRaisesRegex(ValueError, "model.api_key"):
+                AppSettings.load(path)
+
     def test_string_false_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = self.write_config(

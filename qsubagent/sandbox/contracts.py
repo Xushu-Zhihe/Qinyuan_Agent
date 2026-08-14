@@ -8,7 +8,9 @@ from pathlib import Path
 
 
 PROTOCOL_VERSION = 1
-TOOL_PROFILES = frozenset({"no_tools", "nmap_optional"})
+TOOL_PROFILES = frozenset(
+    {"interactive_unrestricted", "no_tools", "nmap_optional"}
+)
 ALLOWED_TOOLS = frozenset({"nmap"})
 COMMAND_FIELDS = frozenset(
     {"protocol_version", "call_id", "tool", "arguments", "timeout_seconds"}
