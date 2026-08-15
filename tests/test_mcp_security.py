@@ -43,7 +43,6 @@ dirsearch = _load_module(
     "qinyuan_test_dirsearch",
     "MCPs/Dirsearch_Mcp/src/server.py",
 )
-web = _load_module("qinyuan_test_web", "MCPs/Web_Mcp/server.py")
 
 NUCLEI_ROOT = ROOT / "MCPs" / "Nuclei_mcp"
 sys.path.insert(0, str(NUCLEI_ROOT))
@@ -67,7 +66,6 @@ class EnabledMcpPolicyTests(unittest.TestCase):
             "nuclei": lambda: nuclei_security.validate_target(
                 "https://example.com"
             ),
-            "web": lambda: web._validate_url("https://example.com"),
         }
 
         for server_name, check in checks.items():
@@ -89,7 +87,6 @@ class EnabledMcpPolicyTests(unittest.TestCase):
                 300,
             ),
             "nuclei": lambda: nuclei_security.validate_timeout(301),
-            "web": lambda: web._validate_timeout(301),
         }
 
         for server_name, check in checks.items():
@@ -140,8 +137,8 @@ class _SuccessfulSession:
     async def call_tool(self, *_args, **_kwargs):
         plan = {
             "sandbox_command": {
-                "tool": "curl",
-                "arguments": ["--url", "http://target-web/"],
+                "tool": "bash",
+                "arguments": ["--noprofile", "--norc", "-lc", "printf ok"],
                 "timeout_seconds": 10,
             }
         }
@@ -203,23 +200,23 @@ class McpManagerTimeoutTests(unittest.IsolatedAsyncioTestCase):
         audit_path = root / "mcp-audit.jsonl"
         sandbox = _SuccessfulSandbox()
         config = MCPServerConfig(
-            name="web",
-            sandbox_tools=frozenset({"curl"}),
+            name="shell",
+            sandbox_tools=frozenset({"bash"}),
         )
         manager = MCPManager(
-            MCPRegistryConfig({"web": config}),
+            MCPRegistryConfig({"shell": config}),
             sandbox,
             audit_path=audit_path,
         )
-        manager.runtimes["web"] = MCPServerRuntime(
+        manager.runtimes["shell"] = MCPServerRuntime(
             config=config,
             session=_SuccessfulSession(),
             status="ready",
         )
-        manager.tool_index["web.http_request"] = MCPToolMeta(
-            server_name="web",
-            tool_name="http_request",
-            qualified_name="web.http_request",
+        manager.tool_index["shell.run_bash"] = MCPToolMeta(
+            server_name="shell",
+            tool_name="run_bash",
+            qualified_name="shell.run_bash",
             description="",
             input_schema={},
             tags=frozenset(),
@@ -227,8 +224,8 @@ class McpManagerTimeoutTests(unittest.IsolatedAsyncioTestCase):
         try:
             result = await manager._execute_bound_tool(
                 agent_id="agent-1",
-                qualified_name="web.http_request",
-                arguments={"url": "http://target-web/"},
+                qualified_name="shell.run_bash",
+                arguments={"script": "printf ok"},
             )
             records = [
                 json.loads(line)
@@ -240,7 +237,7 @@ class McpManagerTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 "finished",
             ])
             self.assertEqual(records[1]["sandbox_id"], "sandbox-1")
-            self.assertEqual(records[1]["tool"], "web.http_request")
+            self.assertEqual(records[1]["tool"], "shell.run_bash")
         finally:
             shutil.rmtree(root, ignore_errors=True)
             try:

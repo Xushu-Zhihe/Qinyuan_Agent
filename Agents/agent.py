@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+BLACKBOARD_RESULT_PREFIX = "BLACKBOARD_RESULT:"
 
 
 # ============================================================
@@ -36,12 +37,18 @@ class ToolCallingAgentRunner:
         tools: Sequence[StructuredTool],
         *,
         max_steps: int = 10,
+        require_tool_call_before_final: bool = False,
+        require_blackboard_progress_before_final: bool = False,
     ) -> None:
         if max_steps < 1:
             raise ValueError("max_steps must be positive")
 
         self.system_prompt = system_prompt
         self.max_steps = max_steps
+        self.require_tool_call_before_final = require_tool_call_before_final
+        self.require_blackboard_progress_before_final = (
+            require_blackboard_progress_before_final
+        )
 
         self.tools = list(tools)
         self.tools_map = {
@@ -96,6 +103,63 @@ class ToolCallingAgentRunner:
             HumanMessage(content=input_data.strip()),
         ]
 
+    @staticmethod
+    def _tool_required_message() -> HumanMessage:
+        return HumanMessage(
+            content=(
+                "The previous response did not call any available tool. "
+                "This is an execution task, not a request for a test plan. "
+                "Call an appropriate available tool and base the result only "
+                "on its output. Do not set goal_achieved to true or emit a "
+                "final answer until the assigned goal is actually verified."
+            )
+        )
+
+    @staticmethod
+    def _empty_incomplete_blackboard_result(content: str) -> bool:
+        marker_index = content.rfind(BLACKBOARD_RESULT_PREFIX)
+        if marker_index < 0:
+            return False
+
+        payload_text = content[
+            marker_index + len(BLACKBOARD_RESULT_PREFIX):
+        ].lstrip()
+        try:
+            payload, _ = json.JSONDecoder().raw_decode(payload_text)
+        except (json.JSONDecodeError, TypeError):
+            return False
+
+        if not isinstance(payload, dict):
+            return False
+
+        return (
+            payload.get("goal_achieved") is False
+            and not payload.get("facts", [])
+            and not payload.get("edges", [])
+        )
+
+    @staticmethod
+    def _blackboard_progress_required_message() -> HumanMessage:
+        return HumanMessage(
+            content=(
+                "The previous BLACKBOARD_RESULT ended the execution with "
+                "goal_achieved=false, facts=[], and edges=[]. That is not a "
+                "valid execution result. Continue the Assigned Intent now "
+                "with an appropriate registered tool. Do not use a no-op, "
+                "echo, or placeholder command merely to satisfy the tool-call "
+                "requirement. Report concrete positive or negative "
+                "observations from the tool output as facts. If the attempted "
+                "verification fails, report the failure, status, or response "
+                "as a fact instead of returning another empty result."
+            )
+        )
+
+    def _final_response_needs_more_execution(self, content: str) -> bool:
+        return (
+            self.require_blackboard_progress_before_final
+            and self._empty_incomplete_blackboard_result(content)
+        )
+
     def run(self, input_data: str) -> str:
         """
         同步执行 Agent。
@@ -105,6 +169,7 @@ class ToolCallingAgentRunner:
         """
 
         messages = self._initial_messages(input_data)
+        tool_required = self.require_tool_call_before_final
 
         for _ in range(self.max_steps):
             response = self.llm.invoke(messages)
@@ -113,8 +178,17 @@ class ToolCallingAgentRunner:
             tool_calls = getattr(response, "tool_calls", None) or []
 
             if not tool_calls:
-                return self._final_content(response)
+                if tool_required:
+                    messages.append(self._tool_required_message())
+                    continue
+                final_content = self._final_content(response)
+                if self._final_response_needs_more_execution(final_content):
+                    messages.append(self._blackboard_progress_required_message())
+                    tool_required = True
+                    continue
+                return final_content
 
+            registered_tool_called = False
             for tool_call in tool_calls:
                 tool_name = tool_call.get("name", "")
                 tool_args = tool_call.get("args", {})
@@ -129,6 +203,7 @@ class ToolCallingAgentRunner:
                         "message": f"Unknown tool: {tool_name}",
                     }
                 else:
+                    registered_tool_called = True
                     try:
                         result = tool.invoke(tool_args)
                     except Exception as error:
@@ -147,6 +222,9 @@ class ToolCallingAgentRunner:
                     )
                 )
 
+            if registered_tool_called:
+                tool_required = False
+
         raise RuntimeError(
             f"Agent exceeded maximum step count: {self.max_steps}"
         )
@@ -160,6 +238,7 @@ class ToolCallingAgentRunner:
         """
 
         messages = self._initial_messages(input_data)
+        tool_required = self.require_tool_call_before_final
 
         for _ in range(self.max_steps):
             response = await self.llm.ainvoke(messages)
@@ -168,8 +247,17 @@ class ToolCallingAgentRunner:
             tool_calls = getattr(response, "tool_calls", None) or []
 
             if not tool_calls:
-                return self._final_content(response)
+                if tool_required:
+                    messages.append(self._tool_required_message())
+                    continue
+                final_content = self._final_content(response)
+                if self._final_response_needs_more_execution(final_content):
+                    messages.append(self._blackboard_progress_required_message())
+                    tool_required = True
+                    continue
+                return final_content
 
+            registered_tool_called = False
             for tool_call in tool_calls:
                 tool_name = tool_call.get("name", "")
                 tool_args = tool_call.get("args", {})
@@ -184,6 +272,7 @@ class ToolCallingAgentRunner:
                         "message": f"Unknown tool: {tool_name}",
                     }
                 else:
+                    registered_tool_called = True
                     try:
                         result = await tool.ainvoke(tool_args)
                     except Exception as error:
@@ -200,6 +289,9 @@ class ToolCallingAgentRunner:
                         tool_call_id=tool_call_id,
                     )
                 )
+
+            if registered_tool_called:
+                tool_required = False
 
         raise RuntimeError(
             f"Agent exceeded maximum step count: {self.max_steps}"
@@ -246,6 +338,8 @@ class SkillAgentFactory:
         *,
         tools: Optional[Sequence[str]] = None,
         max_steps: int = 10,
+        require_tool_call_before_final: bool = False,
+        require_blackboard_progress_before_final: bool = False,
     ) -> ToolCallingAgentRunner:
         """
         直接根据系统提示词创建 Agent。
@@ -273,6 +367,10 @@ class SkillAgentFactory:
             system_prompt=system_prompt.strip(),
             tools=selected_tools,
             max_steps=max_steps,
+            require_tool_call_before_final=require_tool_call_before_final,
+            require_blackboard_progress_before_final=(
+                require_blackboard_progress_before_final
+            ),
         )
     
     def create(
@@ -280,6 +378,8 @@ class SkillAgentFactory:
         skill_name: str,
         tools: Optional[Sequence[str]] = None,
         max_steps: int = 10,
+        require_tool_call_before_final: bool = False,
+        require_blackboard_progress_before_final: bool = False,
     ) -> ToolCallingAgentRunner:
         """根据 SKILL.md 创建 Agent。"""
 
@@ -287,6 +387,10 @@ class SkillAgentFactory:
             self.load_skill_md(skill_name),
             tools=tools,
             max_steps=max_steps,
+            require_tool_call_before_final=require_tool_call_before_final,
+            require_blackboard_progress_before_final=(
+                require_blackboard_progress_before_final
+            ),
         )
 
 

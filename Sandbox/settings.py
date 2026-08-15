@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 
 DEFAULT_ALLOWED_TOOLS = frozenset(
     {
+        "bash",
         "nmap",
         "curl",
         "subfinder",

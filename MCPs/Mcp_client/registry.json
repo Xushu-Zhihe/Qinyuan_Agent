@@ -86,16 +86,13 @@
       "sandboxTools": ["nuclei"],
       "enabled": true
     },
-    "web": {
+    "shell": {
       "transport": "stdio",
       "command": "{python}",
-      "cwd": "../Web_Mcp",
+      "cwd": "../Shell_Mcp",
       "args": ["server.py"],
-      "env": {
-        "MCP_WEB_ALLOWED_HOSTS": "127.0.0.1,localhost,target-web"
-      },
-      "tags": ["http-request", "manual-verification"],
-      "sandboxTools": ["curl", "pwsh"],
+      "tags": ["shell", "command-execution", "manual-verification"],
+      "sandboxTools": ["bash", "pwsh"],
       "enabled": true
     },
     "burp": {

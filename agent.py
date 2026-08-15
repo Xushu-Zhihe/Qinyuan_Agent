@@ -29,6 +29,10 @@ PLANNING_SYSTEM_PROMPT = """
 You are Qinyuan_Agent operating as a planning subagent inside qinyuan-bat.
 The user message is the complete blackboard planning request. Follow its
 instructions exactly. Planning must not call tools or inspect the environment.
+Choose one concrete, executable next action that can produce new evidence.
+Do not create an Intent whose action is merely to write, refine, or describe
+another plan. The Intent content must describe the actual verification to be
+performed by the execution subagent.
 Return normal reasoning if useful, then emit the required protocol line from
 the user request without adding a wrapper or changing its JSON shape.
 """.strip()
@@ -42,7 +46,17 @@ present, /challenge is the read-only challenge input and /work is the writable
 execution workspace. Every reconnaissance or penetration command, including
 PowerShell, must be invoked through the provided tools so it executes in the
 dedicated sandbox; never run or request a host command. Select tools according
-to the assigned Intent and use only explicitly authorized targets. Return
+to the assigned Intent and use only explicitly authorized targets. Report every
+concrete positive or negative observation from tool output as a fact, including
+failed checks, rejected requests, status codes, and absent expected behavior.
+When facts and edges are both empty, continue executing the Assigned Intent
+instead of ending the turn with `goal_achieved` set to false.
+Never treat a proposed next step, test plan, or recommendation as completion.
+Set `goal_achieved` to true only when the assigned blackboard goal itself is
+verified by concrete tool output from this execution. For a goal that asks to
+find a flag, this requires the actual flag value, not a method for looking for
+one. If the goal is not verified, keep `goal_achieved` false and
+`final_answer` null.
 normal reasoning if useful, then emit the required protocol line from the user
 request without adding a wrapper or changing its JSON shape.
 """.strip()
@@ -241,6 +255,8 @@ async def _run_with_tools(
             EXECUTION_SYSTEM_PROMPT,
             tools=tuple(tool_registry),
             max_steps=_positive_steps(),
+            require_tool_call_before_final=True,
+            require_blackboard_progress_before_final=True,
         )
         return await runner.arun(request)
     finally:
@@ -357,6 +373,28 @@ def _optional_path_argument(value: str) -> Path | None:
     return Path(stripped) if stripped else None
 
 
+def _normalize_provider_output(value: str) -> str:
+    """Return valid Unicode while preserving valid UTF-16 surrogate pairs."""
+
+    return value.encode("utf-16-le", errors="surrogatepass").decode(
+        "utf-16-le",
+        errors="replace",
+    )
+
+
+def _configure_standard_streams() -> None:
+    """Enforce the UTF-8 process contract independently of the host locale."""
+
+    for stream, errors in (
+        (sys.stdin, "strict"),
+        (sys.stdout, "strict"),
+        (sys.stderr, "backslashreplace"),
+    ):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors=errors)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run Qinyuan_Agent as a qinyuan-bat provider."
@@ -368,6 +406,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _configure_standard_streams()
     args = _build_parser().parse_args(argv)
 
     request = sys.stdin.read()
@@ -387,6 +426,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"qinyuan-agent: {exc}", file=sys.stderr)
         return 1
 
+    result = _normalize_provider_output(result)
     try:
         sys.stdout.write(result)
         if not result.endswith("\n"):

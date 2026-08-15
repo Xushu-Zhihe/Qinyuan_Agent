@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shlex
 import shutil
 import unittest
 from pathlib import Path
@@ -156,6 +157,73 @@ class DockerRuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await asyncio.to_thread(service.close)
 
+    async def test_shell_mcp_runs_bash_and_powershell_in_sandbox(self) -> None:
+        root = Path(__file__).resolve().parent / ".runtime-work" / uuid4().hex
+        work = root / "work"
+        work.mkdir(parents=True)
+        settings = SandboxSettings()
+        service = SandboxService(
+            await asyncio.to_thread(DockerRuntime, settings),
+            settings,
+        )
+        manager = None
+        try:
+            await asyncio.to_thread(
+                service.start_for_agent,
+                "integration-shell",
+                SandboxMounts(work_dir=work),
+            )
+            manager = await build_mcp_runtime(
+                service,
+                allowed_servers={"shell"},
+                audit_path=work / "mcp-audit.jsonl",
+            )
+            client = manager.bind_agent(
+                "integration-shell",
+                allowed_tools={"shell.run_bash", "shell.run_powershell"},
+            )
+
+            bash_result = await client.call_tool(
+                "shell.run_bash",
+                {"script": "printf 'bash-ok\\n'"},
+            )
+            powershell_result = await client.call_tool(
+                "shell.run_powershell",
+                {"script": "Write-Output 'powershell-ok'"},
+            )
+
+            self.assertEqual(bash_result.status, "completed", bash_result.stderr)
+            self.assertEqual(bash_result.stdout.strip(), "bash-ok")
+            self.assertEqual(
+                powershell_result.status,
+                "completed",
+                powershell_result.stderr,
+            )
+            self.assertEqual(powershell_result.stdout.strip(), "powershell-ok")
+            records = [
+                json.loads(line)
+                for line in (work / "mcp-audit.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(
+                {
+                    record["tool"]
+                    for record in records
+                    if record["event"] == "finished"
+                },
+                {"shell.run_bash", "shell.run_powershell"},
+            )
+        finally:
+            if manager is not None:
+                await manager.stop_all()
+            await asyncio.to_thread(service.close)
+            shutil.rmtree(root, ignore_errors=True)
+            try:
+                root.parent.rmdir()
+            except OSError:
+                pass
+
     async def test_image_contains_all_registered_runtime_tools(self) -> None:
         settings = SandboxSettings(
             allowed_tools=frozenset({"python3", "pwsh"})
@@ -174,7 +242,7 @@ class DockerRuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     arguments=(
                         "-c",
                         "import shutil,sys; "
-                        "tools=['nmap','curl','subfinder','amass','httpx',"
+                        "tools=['bash','nmap','curl','subfinder','amass','httpx',"
                         "'ffuf','dirsearch','nuclei','pwsh']; "
                         "missing=[tool for tool in tools if not shutil.which(tool)]; "
                         "print(','.join(missing)); sys.exit(bool(missing))",
@@ -226,28 +294,44 @@ class DockerRuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
         try:
             await asyncio.to_thread(
                 service.start_for_agent,
-                "integration-authorized-web",
+                "integration-authorized-shell",
                 SandboxMounts(work_dir=work),
             )
             manager = await build_mcp_runtime(
                 service,
-                allowed_servers={"web"},
+                allowed_servers={"shell"},
                 audit_path=work / "mcp-audit.jsonl",
             )
             client = manager.bind_agent(
-                "integration-authorized-web",
+                "integration-authorized-shell",
                 allowed_tools={
-                    "web.http_request",
-                    "web.powershell_http_request",
+                    "shell.run_bash",
+                    "shell.run_powershell",
                 },
             )
             curl_result = await client.call_tool(
-                "web.http_request",
-                {"url": AUTHORIZED_TARGET_URL, "timeout_seconds": 30},
+                "shell.run_bash",
+                {
+                    "script": (
+                        "curl --silent --show-error --include --max-time 30 "
+                        f"--url {shlex.quote(AUTHORIZED_TARGET_URL)}"
+                    ),
+                    "timeout_seconds": 35,
+                },
             )
+            powershell_target = AUTHORIZED_TARGET_URL.replace("'", "''")
             powershell_result = await client.call_tool(
-                "web.powershell_http_request",
-                {"url": AUTHORIZED_TARGET_URL, "timeout_seconds": 30},
+                "shell.run_powershell",
+                {
+                    "script": (
+                        "$response = Invoke-WebRequest "
+                        f"-Uri '{powershell_target}' -UseBasicParsing "
+                        "-SkipHttpErrorCheck -TimeoutSec 30; "
+                        "Write-Output ('HTTP status: {0}' -f "
+                        "[int]$response.StatusCode); Write-Output $response.Content"
+                    ),
+                    "timeout_seconds": 35,
+                },
             )
             self.assertEqual(
                 curl_result.status,
@@ -274,7 +358,7 @@ class DockerRuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
             }
             self.assertEqual(
                 finished_tools,
-                {"web.http_request", "web.powershell_http_request"},
+                {"shell.run_bash", "shell.run_powershell"},
             )
         finally:
             if manager is not None:

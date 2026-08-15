@@ -4,7 +4,7 @@ import os
 import re
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from MCPs.fastmcp_compat import FastMCP
 
 
 mcp = FastMCP(

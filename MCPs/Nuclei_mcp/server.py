@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from mcp.server.fastmcp import FastMCP
+from MCPs.fastmcp_compat import FastMCP
 
 from nuclei_mcp.tools import register_tools
 

@@ -1,25 +1,34 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import shutil
 import signal
+import sys
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-from Agents.agent import PROJECT_ROOT, SkillAgentFactory
+from Agents.agent import (
+    PROJECT_ROOT,
+    SkillAgentFactory,
+    ToolCallingAgentRunner,
+)
 from agent import (
     EXECUTION_PREFIX,
     PLANNING_PREFIX,
     TIMEOUT_PREFIX,
     AgentInterrupted,
     _execution_identity,
+    _normalize_provider_output,
     _optional_csv_environment,
     _optional_path_argument,
     _run_request_with_signal_handlers,
     classify_request,
+    main,
     run_request,
 )
+from langchain_core.tools import StructuredTool
 
 
 class _Response:
@@ -38,6 +47,28 @@ class _FakeLLM:
         return _Response(self.content)
 
 
+class _SequencedLLM:
+    def __init__(self, responses: list[_Response]) -> None:
+        self.responses = responses
+        self.calls = 0
+        self.message_snapshots = []
+
+    def bind_tools(self, _tools):
+        return self
+
+    async def ainvoke(self, messages):
+        self.message_snapshots.append(list(messages))
+        response = self.responses[self.calls]
+        self.calls += 1
+        return response
+
+
+class _ToolResponse(_Response):
+    def __init__(self, content: str, tool_calls: list[dict[str, object]]) -> None:
+        super().__init__(content)
+        self.tool_calls = tool_calls
+
+
 class AgentCliTests(unittest.IsolatedAsyncioTestCase):
     def test_classifies_qinyuan_bat_request_headers(self) -> None:
         self.assertEqual(classify_request(PLANNING_PREFIX + "\nbody"), "planning")
@@ -53,6 +84,201 @@ class AgentCliTests(unittest.IsolatedAsyncioTestCase):
         result = await run_request(PLANNING_PREFIX + "\nbody", llm=llm)
         self.assertIn("BLACKBOARD_INTENT:", result)
         self.assertEqual(llm.calls, 1)
+
+    async def test_execution_runner_requires_tool_before_final_response(self) -> None:
+        tool = StructuredTool.from_function(
+            lambda: {"status": "completed", "stdout": "verified"},
+            name="probe",
+            description="Run the verification probe",
+        )
+        llm = _SequencedLLM(
+            [
+                _Response(
+                    'BLACKBOARD_RESULT: {"goal_achieved":true,'
+                    '"final_answer":"a proposed next step"}'
+                ),
+                _ToolResponse(
+                    "",
+                    [{"name": "probe", "args": {}, "id": "call-1"}],
+                ),
+                _Response(
+                    'BLACKBOARD_RESULT: {"goal_achieved":false,'
+                    '"final_answer":null}'
+                ),
+            ]
+        )
+        runner = ToolCallingAgentRunner(
+            llm=llm,
+            system_prompt="execution",
+            tools=[tool],
+            max_steps=3,
+            require_tool_call_before_final=True,
+        )
+
+        result = await runner.arun("execute")
+
+        self.assertIn('"goal_achieved":false', result)
+        self.assertEqual(llm.calls, 3)
+
+    async def test_execution_runner_rejects_repeated_unverified_completion(
+        self,
+    ) -> None:
+        llm = _FakeLLM(
+            'BLACKBOARD_RESULT: {"goal_achieved":true,'
+            '"final_answer":"a proposed next step"}'
+        )
+        runner = ToolCallingAgentRunner(
+            llm=llm,
+            system_prompt="execution",
+            tools=[],
+            max_steps=2,
+            require_tool_call_before_final=True,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "maximum step count"):
+            await runner.arun("execute")
+
+        self.assertEqual(llm.calls, 2)
+
+    async def test_empty_result_requires_another_real_tool_call(self) -> None:
+        calls: list[str] = []
+        no_op = StructuredTool.from_function(
+            lambda: calls.append("no-op") or {
+                "status": "completed",
+                "stdout": "placeholder",
+            },
+            name="no_op",
+            description="Return a placeholder",
+        )
+        probe = StructuredTool.from_function(
+            lambda: calls.append("probe") or {
+                "status": "completed",
+                "stdout": "HTTP 403",
+            },
+            name="probe",
+            description="Run the assigned verification",
+        )
+        llm = _SequencedLLM(
+            [
+                _ToolResponse(
+                    "",
+                    [{"name": "no_op", "args": {}, "id": "call-1"}],
+                ),
+                _Response(
+                    'BLACKBOARD_RESULT: {"facts":[],"edges":[],'
+                    '"goal_achieved":false,"final_answer":null}'
+                ),
+                _ToolResponse(
+                    "",
+                    [{"name": "probe", "args": {}, "id": "call-2"}],
+                ),
+                _Response(
+                    'BLACKBOARD_RESULT: {"facts":[{"content":'
+                    '"The assigned request returned HTTP 403."}],'
+                    '"edges":[],"goal_achieved":false,'
+                    '"final_answer":null}'
+                ),
+            ]
+        )
+        runner = ToolCallingAgentRunner(
+            llm=llm,
+            system_prompt="execution",
+            tools=[no_op, probe],
+            max_steps=4,
+            require_tool_call_before_final=True,
+            require_blackboard_progress_before_final=True,
+        )
+
+        result = await runner.arun("execute the Assigned Intent")
+
+        self.assertIn("HTTP 403", result)
+        self.assertEqual(calls, ["no-op", "probe"])
+        correction_messages = llm.message_snapshots[2]
+        self.assertTrue(
+            any(
+                "not a valid execution result" in str(message.content)
+                for message in correction_messages
+            )
+        )
+
+    async def test_repeated_tools_with_empty_results_reach_step_limit(
+        self,
+    ) -> None:
+        calls: list[str] = []
+        no_op = StructuredTool.from_function(
+            lambda: calls.append("no-op") or {
+                "status": "completed",
+                "stdout": "placeholder",
+            },
+            name="no_op",
+            description="Return a placeholder",
+        )
+        empty_result = (
+            'BLACKBOARD_RESULT: {"facts":[],"edges":[],'
+            '"goal_achieved":false,"final_answer":null}'
+        )
+        llm = _SequencedLLM(
+            [
+                _ToolResponse(
+                    "",
+                    [{"name": "no_op", "args": {}, "id": "call-1"}],
+                ),
+                _Response(empty_result),
+                _ToolResponse(
+                    "",
+                    [{"name": "no_op", "args": {}, "id": "call-2"}],
+                ),
+                _Response(empty_result),
+            ]
+        )
+        runner = ToolCallingAgentRunner(
+            llm=llm,
+            system_prompt="execution",
+            tools=[no_op],
+            max_steps=4,
+            require_tool_call_before_final=True,
+            require_blackboard_progress_before_final=True,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "maximum step count"):
+            await runner.arun("execute the Assigned Intent")
+
+        self.assertEqual(calls, ["no-op", "no-op"])
+        self.assertEqual(llm.calls, 4)
+
+    async def test_negative_observation_is_valid_execution_progress(self) -> None:
+        probe = StructuredTool.from_function(
+            lambda: {"status": "completed", "stdout": "connection refused"},
+            name="probe",
+            description="Run the assigned verification",
+        )
+        expected = (
+            'BLACKBOARD_RESULT: {"facts":[{"content":'
+            '"The target refused the connection."}],"edges":[],'
+            '"goal_achieved":false,"final_answer":null}'
+        )
+        llm = _SequencedLLM(
+            [
+                _ToolResponse(
+                    "",
+                    [{"name": "probe", "args": {}, "id": "call-1"}],
+                ),
+                _Response(expected),
+            ]
+        )
+        runner = ToolCallingAgentRunner(
+            llm=llm,
+            system_prompt="execution",
+            tools=[probe],
+            max_steps=2,
+            require_tool_call_before_final=True,
+            require_blackboard_progress_before_final=True,
+        )
+
+        result = await runner.arun("execute the Assigned Intent")
+
+        self.assertEqual(result, expected)
+        self.assertEqual(llm.calls, 2)
 
     async def test_timeout_request_runs_without_tools(self) -> None:
         llm = _FakeLLM("BLACKBOARD_RESULT: {\"intent_id\":\"i\"}")
@@ -124,6 +350,37 @@ class AgentCliTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             _execution_identity(work_dir),
             _execution_identity(work_dir),
+        )
+
+    def test_provider_output_normalizes_surrogate_characters(self) -> None:
+        output = _normalize_provider_output("valid \ud83d\ude00 invalid \udcbd")
+
+        self.assertEqual(output, "valid \U0001f600 invalid \ufffd")
+        self.assertEqual(
+            output.encode("utf-8").decode("utf-8"),
+            output,
+        )
+
+    def test_main_writes_surrogate_response_as_valid_utf8(self) -> None:
+        raw_output = io.BytesIO()
+        stdout = io.TextIOWrapper(raw_output, encoding="gbk", errors="strict")
+        response = "BLACKBOARD_RESULT: {\"content\":\"中文\udcbd\"}"
+
+        with (
+            patch.object(sys, "stdin", io.StringIO("request")),
+            patch.object(sys, "stdout", stdout),
+            patch(
+                "agent._run_request_with_signal_handlers",
+                new=AsyncMock(return_value=response),
+            ),
+        ):
+            status = main([])
+            stdout.flush()
+
+        self.assertEqual(status, 0)
+        self.assertEqual(
+            raw_output.getvalue().decode("utf-8").splitlines(),
+            ["BLACKBOARD_RESULT: {\"content\":\"中文\ufffd\"}"],
         )
 
     async def test_termination_signal_cancels_active_request(self) -> None:

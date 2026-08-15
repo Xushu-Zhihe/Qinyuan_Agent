@@ -5,7 +5,7 @@ import re
 from typing import Any
 from urllib.parse import urlparse
 
-from mcp.server.fastmcp import FastMCP
+from MCPs.fastmcp_compat import FastMCP
 
 
 mcp = FastMCP(
