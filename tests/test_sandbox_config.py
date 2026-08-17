@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 from MCPs.Mcp_client import load_registry, select_registry_servers
-from Sandbox.docker_runtime import DockerRuntime
+from Sandbox.docker_runtime import DockerRuntime, DockerRuntimeError
 from Sandbox.models import SandboxMounts
 from Sandbox.service import SandboxError, SandboxService
 from Sandbox.settings import SandboxSettings
@@ -70,6 +70,17 @@ class _FakeContainers:
 
 
 class SandboxConfigurationTests(unittest.TestCase):
+    def test_docker_connection_error_preserves_underlying_cause(self) -> None:
+        with patch(
+            "Sandbox.docker_runtime.docker.from_env",
+            side_effect=PermissionError("access denied to Docker Desktop socket"),
+        ):
+            with self.assertRaisesRegex(
+                DockerRuntimeError,
+                "Cannot connect to Docker: access denied to Docker Desktop socket",
+            ):
+                DockerRuntime(SandboxSettings())
+
     def test_mounts_resolve_sibling_directories(self) -> None:
         with _directories() as (_, challenge, work):
             mounts = SandboxMounts(challenge, work)

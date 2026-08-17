@@ -233,11 +233,18 @@ class MCPManager:
         sandbox_service: SandboxService,
         *,
         mcp_call_timeout_seconds: float = 10.0,
+        startup_timeout_seconds: float = 30.0,
+        shutdown_timeout_seconds: float = 10.0,
         output_character_limit: int = 20_000,
         audit_path: str | Path | None = None,
+        required_servers: Iterable[str] | None = None,
     ) -> None:
         if mcp_call_timeout_seconds <= 0:
             raise ValueError("mcp_call_timeout_seconds must be positive")
+        if startup_timeout_seconds <= 0:
+            raise ValueError("startup_timeout_seconds must be positive")
+        if shutdown_timeout_seconds <= 0:
+            raise ValueError("shutdown_timeout_seconds must be positive")
 
         if output_character_limit < 1_000:
             raise ValueError("output_character_limit must be at least 1000")
@@ -245,11 +252,33 @@ class MCPManager:
         self.registry = registry
         self.sandbox_service = sandbox_service
         self.mcp_call_timeout_seconds = mcp_call_timeout_seconds
+        self.startup_timeout_seconds = startup_timeout_seconds
+        self.shutdown_timeout_seconds = shutdown_timeout_seconds
         self.output_character_limit = output_character_limit
         self.audit_path = Path(audit_path).resolve() if audit_path is not None else None
 
+        requested_required = frozenset(
+            item.strip() for item in (required_servers or ()) if item.strip()
+        )
+        unknown_required = requested_required.difference(registry.servers)
+        if unknown_required:
+            raise ValueError(
+                f"unknown required MCP servers: {sorted(unknown_required)}"
+            )
+        disabled_required = {
+            name for name in requested_required
+            if not registry.servers[name].enabled
+        }
+        if disabled_required:
+            raise ValueError(
+                "required MCP servers cannot be disabled: "
+                f"{sorted(disabled_required)}"
+            )
+        self.required_servers = requested_required
+
         self.runtimes: dict[str, MCPServerRuntime] = {}
         self.tool_index: dict[str, MCPToolMeta] = {}
+        self.startup_failures: dict[str, str] = {}
 
         self._event_loop: asyncio.AbstractEventLoop | None = None
         self._event_loop_thread_id: int | None = None
@@ -282,16 +311,34 @@ class MCPManager:
         self._event_loop = asyncio.get_running_loop()
         self._event_loop_thread_id = threading.get_ident()
 
-        try:
-            for config in self.registry.servers.values():
-                if config.enabled:
-                    await self._start_server(config)
-        except Exception:
+        failures: dict[str, str] = {}
+        for config in self.registry.servers.values():
+            if not config.enabled:
+                continue
+            try:
+                await self._start_server(config)
+            except Exception as exc:
+                failures[config.name] = str(exc)
+        self.startup_failures = failures
+
+        required_failures = {
+            name: failures.get(name, f"MCP server {name!r} did not become ready")
+            for name in self.required_servers
+            if name not in self.runtimes
+        }
+        if required_failures or not self.runtimes:
             try:
                 await self.stop_all()
-            except Exception:
-                pass
-            raise
+            except Exception as exc:
+                failures["cleanup"] = str(exc)
+            details = {**failures, **required_failures}
+            detail = "; ".join(
+                f"{name}: {message}" for name, message in details.items()
+            )
+            raise MCPClientError(
+                "no usable MCP servers are available" if not detail
+                else f"MCP startup failed: {detail}"
+            )
 
     async def _start_server(self,config: MCPServerConfig) -> None:
         if config.name in self.runtimes:
@@ -326,34 +373,55 @@ class MCPManager:
                 )
 
                 read_stream,write_stream =(
-                    await runtime.exit_stack.enter_async_context(
-                        stdio_client(parameters)
+                    await asyncio.wait_for(
+                        runtime.exit_stack.enter_async_context(
+                            stdio_client(parameters)
+                        ),
+                        timeout=self.startup_timeout_seconds,
                     )
                 )
             else:
                 read_stream,write_stream,_ = (
-                    await runtime.exit_stack.enter_async_context(
-                        streamable_http_client(config.url or "")
+                    await asyncio.wait_for(
+                        runtime.exit_stack.enter_async_context(
+                            streamable_http_client(config.url or "")
+                        ),
+                        timeout=self.startup_timeout_seconds,
                     )
                 )
 
-            session = await runtime.exit_stack.enter_async_context(
-                ClientSession(read_stream,write_stream)
+            session = await asyncio.wait_for(
+                runtime.exit_stack.enter_async_context(
+                    ClientSession(read_stream,write_stream)
+                ),
+                timeout=self.startup_timeout_seconds,
             )
 
-            await session.initialize()
+            await asyncio.wait_for(
+                session.initialize(),
+                timeout=self.startup_timeout_seconds,
+            )
 
             runtime.session = session
             runtime.status = "ready"
             self.runtimes[config.name] = runtime
 
-            await self.refresh_tools(config.name)
+            await asyncio.wait_for(
+                self.refresh_tools(config.name),
+                timeout=self.startup_timeout_seconds,
+            )
 
         except Exception as exc:
             runtime.status = "failed"
             runtime.last_error = str(exc)
             self.runtimes.pop(config.name,None) 
-            await runtime.exit_stack.aclose()
+            try:
+                await asyncio.wait_for(
+                    runtime.exit_stack.aclose(),
+                    timeout=self.shutdown_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                pass
             raise MCPClientError(
                 f"failed to start MCP server {config.name!r}: {exc}"
             ) from exc
@@ -365,7 +433,15 @@ class MCPManager:
 
         for runtime in reversed(list(self.runtimes.values())):
             try:
-                await runtime.exit_stack.aclose()
+                await asyncio.wait_for(
+                    runtime.exit_stack.aclose(),
+                    timeout=self.shutdown_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                errors.append(
+                    f"{runtime.config.name}: shutdown timed out after "
+                    f"{self.shutdown_timeout_seconds:g}s"
+                )
             except Exception as exc:
                 errors.append(f"{runtime.config.name}: {exc}")
             finally:
@@ -374,6 +450,7 @@ class MCPManager:
 
         self.runtimes.clear()
         self.tool_index.clear()
+        self.startup_failures.clear()
         self._event_loop = None
         self._event_loop_thread_id = None
 
@@ -392,7 +469,10 @@ class MCPManager:
                 f"MCP server {server_name!r} is not ready"
             )
 
-        result = await runtime.session.list_tools()
+        result = await asyncio.wait_for(
+            runtime.session.list_tools(),
+            timeout=self.startup_timeout_seconds,
+        )
 
         for old_name in runtime.tools:
             self.tool_index.pop(old_name,None)
@@ -773,6 +853,7 @@ async def build_mcp_runtime(
     registry_path: str | Path | None = None,
     *,
     allowed_servers: Iterable[str] | None = None,
+    required_servers: Iterable[str] | None = None,
     audit_path: str | Path | None = None,
 ) -> MCPManager:
     if registry_path is None:
@@ -784,6 +865,19 @@ async def build_mcp_runtime(
             allowed_servers,
         ),
         sandbox_service=sandbox_service,
+        mcp_call_timeout_seconds=float(
+            os.environ.get("QINYUAN_MCP_CALL_TIMEOUT_SECONDS", "10")
+        ),
+        startup_timeout_seconds=float(
+            os.environ.get("QINYUAN_MCP_STARTUP_TIMEOUT_SECONDS", "30")
+        ),
+        shutdown_timeout_seconds=float(
+            os.environ.get("QINYUAN_MCP_SHUTDOWN_TIMEOUT_SECONDS", "10")
+        ),
+        output_character_limit=int(
+            os.environ.get("QINYUAN_MCP_OUTPUT_CHARACTER_LIMIT", "20000")
+        ),
+        required_servers=required_servers,
         audit_path=audit_path,
     )
 

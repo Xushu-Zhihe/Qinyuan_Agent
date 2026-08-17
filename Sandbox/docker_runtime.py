@@ -13,6 +13,20 @@ from Sandbox.settings import SandboxSettings
 class DockerRuntimeError(RuntimeError):
     pass
 
+
+def _connection_failure_message(error: BaseException) -> str:
+    """Keep the actionable Docker daemon error without dumping a traceback."""
+
+    detail = " ".join(str(error).split())
+    if not detail:
+        return "Cannot connect to Docker."
+    # Docker Desktop may include a long socket/HTTP diagnostic. Keep provider
+    # stderr bounded while retaining the permission/endpoint hint users need.
+    if len(detail) > 300:
+        detail = detail[:297] + "..."
+    return f"Cannot connect to Docker: {detail}"
+
+
 class DockerRuntime:
     def __init__(
         self,
@@ -61,9 +75,7 @@ class DockerRuntime:
                 except Exception:
                     pass
 
-            raise DockerRuntimeError(
-                "Cannot connect to Docker."
-            ) from error
+            raise DockerRuntimeError(_connection_failure_message(error)) from error
 
     def create(self, agent_id: str, mounts: SandboxMounts) -> str:
         self._ensure_image_exists()
@@ -417,7 +429,7 @@ class DockerRuntime:
         except ImageNotFound as error:
             raise DockerRuntimeError(
                 f"Sandbox image {self.settings.image!r} does not exist."
-                "Build the sandbox iamge before startign agents."
+                " Build the sandbox image before starting agents."
             ) from error
 
     def _get_running_container(self,sandbox_id:str):

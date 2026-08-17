@@ -4,5 +4,5 @@ docker build `
   --provenance=false `
   --sbom=false `
   --file Sandbox/dockerfile `
-  --tag qinyuan/pentest-sandbox:0.2.0 `
+  --tag qinyuan/pentest-sandbox:0.3.1 `
   .

@@ -43,6 +43,14 @@ class KimiChat(ChatOpenAI):
                 "请设置环境变量或在初始化时传入api_key参数。"
             )
         
+        kwargs.setdefault(
+            "timeout",
+            float(os.environ.get("QINYUAN_LLM_TIMEOUT_SECONDS", "90")),
+        )
+        kwargs.setdefault(
+            "max_retries",
+            int(os.environ.get("QINYUAN_LLM_MAX_RETRIES", "1")),
+        )
         super().__init__(
             api_key=api_key,
             base_url=base_url,

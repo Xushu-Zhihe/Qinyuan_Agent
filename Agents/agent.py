@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -39,9 +41,19 @@ class ToolCallingAgentRunner:
         max_steps: int = 10,
         require_tool_call_before_final: bool = False,
         require_blackboard_progress_before_final: bool = False,
+        llm_timeout_seconds: float | None = None,
+        max_tool_result_chars: int = 12_000,
     ) -> None:
         if max_steps < 1:
             raise ValueError("max_steps must be positive")
+        if llm_timeout_seconds is None:
+            llm_timeout_seconds = float(
+                os.environ.get("QINYUAN_LLM_TIMEOUT_SECONDS", "180.0")
+            )
+        if llm_timeout_seconds <= 0:
+            raise ValueError("llm_timeout_seconds must be positive")
+        if max_tool_result_chars < 1_000:
+            raise ValueError("max_tool_result_chars must be at least 1000")
 
         self.system_prompt = system_prompt
         self.max_steps = max_steps
@@ -49,6 +61,8 @@ class ToolCallingAgentRunner:
         self.require_blackboard_progress_before_final = (
             require_blackboard_progress_before_final
         )
+        self.llm_timeout_seconds = llm_timeout_seconds
+        self.max_tool_result_chars = max_tool_result_chars
 
         self.tools = list(tools)
         self.tools_map = {
@@ -111,8 +125,23 @@ class ToolCallingAgentRunner:
                 "This is an execution task, not a request for a test plan. "
                 "Call an appropriate available tool and base the result only "
                 "on its output. Do not set goal_achieved to true or emit a "
-                "final answer until the assigned goal is actually verified."
+                "final answer until the whole Goal, rather than only the "
+                "current Assigned Intent, is actually verified."
             )
+        )
+
+    def _serialize_tool_result(self, value: Any) -> str:
+        content = self._serialize_content(value)
+        if len(content) <= self.max_tool_result_chars:
+            return content
+        marker = "\n...[tool output truncated]...\n"
+        available = max(0, self.max_tool_result_chars - len(marker))
+        left = available // 2
+        right = available - left
+        return (
+            content[:left]
+            + marker
+            + (content[-right:] if right else "")
         )
 
     @staticmethod
@@ -217,7 +246,7 @@ class ToolCallingAgentRunner:
 
                 messages.append(
                     ToolMessage(
-                        content=self._serialize_content(result),
+                        content=self._serialize_tool_result(result),
                         tool_call_id=tool_call_id,
                     )
                 )
@@ -241,7 +270,16 @@ class ToolCallingAgentRunner:
         tool_required = self.require_tool_call_before_final
 
         for _ in range(self.max_steps):
-            response = await self.llm.ainvoke(messages)
+            try:
+                response = await asyncio.wait_for(
+                    self.llm.ainvoke(messages),
+                    timeout=self.llm_timeout_seconds,
+                )
+            except asyncio.TimeoutError as exc:
+                raise TimeoutError(
+                    "LLM request timed out after "
+                    f"{self.llm_timeout_seconds:g} seconds"
+                ) from exc
             messages.append(response)
 
             tool_calls = getattr(response, "tool_calls", None) or []
@@ -285,7 +323,7 @@ class ToolCallingAgentRunner:
 
                 messages.append(
                     ToolMessage(
-                        content=self._serialize_content(result),
+                        content=self._serialize_tool_result(result),
                         tool_call_id=tool_call_id,
                     )
                 )

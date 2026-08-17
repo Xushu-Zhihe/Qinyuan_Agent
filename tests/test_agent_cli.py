@@ -15,8 +15,11 @@ from Agents.agent import (
     ToolCallingAgentRunner,
 )
 from agent import (
+    EXECUTION_SYSTEM_PROMPT,
     EXECUTION_PREFIX,
     PLANNING_PREFIX,
+    PLANNING_SYSTEM_PROMPT,
+    TIMEOUT_SYSTEM_PROMPT,
     TIMEOUT_PREFIX,
     AgentInterrupted,
     _execution_identity,
@@ -24,6 +27,7 @@ from agent import (
     _optional_csv_environment,
     _optional_path_argument,
     _run_request_with_signal_handlers,
+    _stage_requested_execution_logs,
     classify_request,
     main,
     run_request,
@@ -70,6 +74,12 @@ class _ToolResponse(_Response):
 
 
 class AgentCliTests(unittest.IsolatedAsyncioTestCase):
+    def test_prompts_distinguish_intent_completion_from_goal_completion(self) -> None:
+        self.assertIn("An Intent being completed never means", PLANNING_SYSTEM_PROMPT)
+        self.assertIn("There are two separate completion decisions", EXECUTION_SYSTEM_PROMPT)
+        self.assertIn("goal_achieved` to false", EXECUTION_SYSTEM_PROMPT)
+        self.assertIn("whole Goal", TIMEOUT_SYSTEM_PROMPT)
+
     def test_classifies_qinyuan_bat_request_headers(self) -> None:
         self.assertEqual(classify_request(PLANNING_PREFIX + "\nbody"), "planning")
         self.assertEqual(classify_request(EXECUTION_PREFIX + "\nbody"), "execution")
@@ -351,6 +361,34 @@ class AgentCliTests(unittest.IsolatedAsyncioTestCase):
             _execution_identity(work_dir),
             _execution_identity(work_dir),
         )
+
+    def test_stages_only_referenced_sibling_execution_logs(self) -> None:
+        root = Path(__file__).resolve().parent / ".stage-work"
+        executions = root / "executions"
+        current = executions / "run-qinyuan-agent-current"
+        previous = executions / "run-qinyuan-agent-808eea68911d4ef1b3853adcb2810579"
+        try:
+            current.mkdir(parents=True)
+            previous.mkdir()
+            (previous / "stdout.txt").write_text("previous stdout\n", encoding="utf-8")
+            (previous / "stderr.txt").write_text("previous stderr\n", encoding="utf-8")
+            staged = _stage_requested_execution_logs(
+                f"read {previous.name}/stdout.txt and {previous.name}/stderr.txt",
+                current,
+            )
+
+            self.assertEqual(staged, (previous.name,))
+            staged_root = current / "_previous_runs" / previous.name
+            self.assertEqual(
+                (staged_root / "stdout.txt").read_text(encoding="utf-8"),
+                "previous stdout\n",
+            )
+            self.assertEqual(
+                (staged_root / "stderr.txt").read_text(encoding="utf-8"),
+                "previous stderr\n",
+            )
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
 
     def test_provider_output_normalizes_surrogate_characters(self) -> None:
         output = _normalize_provider_output("valid \ud83d\ude00 invalid \udcbd")
