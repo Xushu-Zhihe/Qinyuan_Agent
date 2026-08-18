@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import json
 import os
 import re
 import signal
@@ -85,7 +86,7 @@ There are two separate completion decisions:
 
 When the Assigned Intent is complete but the whole Goal is not proven, emit a
 normal result with the observed facts and useful edges, but set
-`goal_achieved` to false, `answer_key` to null, and `final_answer` to null.
+`goal_achieved` to false and `goal_result_ref` to null.
 This is a successful partial execution, not a failure. The blackboard planner
 will use those facts to create the next Intent. Do not set `true` merely to
 signal that the current Intent finished.
@@ -105,7 +106,7 @@ Set `goal_achieved` to true only when the whole Goal is verified by concrete
 tool output from this execution together with the relevant accumulated
 blackboard evidence. Do not infer completion from a `supports` edge that you
 propose yourself. If the Goal is not verified, keep `goal_achieved` false and
-both answer fields null.
+`goal_result_ref` null.
 normal reasoning if useful, then emit the required protocol line from the user
 request without adding a wrapper or changing its JSON shape.
 """.strip()
@@ -117,9 +118,22 @@ environment, or continue the investigation. Preserve only explicitly
 verified facts from the captured output and emit the required protocol line.
 An Intent may have completed without completing the whole Goal. Never turn a
 partial result, recommendation, path, status, or error into `goal_achieved`;
-set it false with null answer fields unless the captured evidence explicitly
+set it false with a null `goal_result_ref` unless the captured evidence explicitly
 proves the entire Goal.
 """.strip()
+
+V2_RESULT_INSTRUCTION = """
+The provider result protocol is BLACKBOARD_RESULT v2. Emit exactly one line
+with JSON fields protocol_version, intent_id, facts, edges, goal_achieved, and
+goal_result_ref. Set protocol_version to 2. goal_result_ref must name one
+self-contained Fact that directly addresses the current Goal; supporting
+evidence is not the result Fact. Use null when the Goal is not achieved.
+Preserve complete text or JSON result content; do not reduce it to a flag or
+answer key.
+""".strip()
+
+EXECUTION_SYSTEM_PROMPT = EXECUTION_SYSTEM_PROMPT + "\n\n" + V2_RESULT_INSTRUCTION
+TIMEOUT_SYSTEM_PROMPT = TIMEOUT_SYSTEM_PROMPT + "\n\n" + V2_RESULT_INSTRUCTION
 
 
 def classify_request(request: str) -> RequestMode:
@@ -364,6 +378,7 @@ async def _run_with_tools(
     llm: Any,
     challenge_dir: Path | None,
     work_dir: Path | None,
+    required_skill_text: str | None = None,
 ) -> str:
     from Agents.agent import SkillAgentFactory
     from MCPs.Mcp_client import build_mcp_runtime
@@ -437,7 +452,7 @@ async def _run_with_tools(
             llm=llm,
             tool_registry=tool_registry,
         ).create_from_prompt(
-            EXECUTION_SYSTEM_PROMPT,
+            _with_required_skill(EXECUTION_SYSTEM_PROMPT, required_skill_text),
             tools=tuple(tool_registry),
             max_steps=_positive_steps(),
             require_tool_call_before_final=True,
@@ -470,6 +485,7 @@ async def run_request(
     llm: Any | None = None,
     challenge_dir: Path | None = None,
     work_dir: Path | None = None,
+    required_skill_text: str | None = None,
 ) -> str:
     """Run one stateless request using qinyuan-bat's existing protocol."""
 
@@ -488,13 +504,21 @@ async def run_request(
         return await _run_without_tools(
             request,
             configured_llm,
-            TIMEOUT_SYSTEM_PROMPT,
+            _with_required_skill(TIMEOUT_SYSTEM_PROMPT, required_skill_text),
+        )
+    if required_skill_text is None:
+        return await _run_with_tools(
+            request,
+            configured_llm,
+            challenge_dir,
+            work_dir,
         )
     return await _run_with_tools(
         request,
         configured_llm,
         challenge_dir,
         work_dir,
+        required_skill_text,
     )
 
 
@@ -503,6 +527,7 @@ async def _run_request_with_signal_handlers(
     *,
     challenge_dir: Path | None,
     work_dir: Path | None,
+    required_skill_text: str | None = None,
 ) -> str:
     current_task = asyncio.current_task()
     if current_task is None:
@@ -539,6 +564,7 @@ async def _run_request_with_signal_handlers(
             request,
             challenge_dir=challenge_dir,
             work_dir=work_dir,
+            required_skill_text=required_skill_text,
         )
     except asyncio.CancelledError as exc:
         if interrupted_by or cancelled_by_file:
@@ -567,6 +593,78 @@ def _normalize_provider_output(value: str) -> str:
     )
 
 
+def _with_required_skill(base_prompt: str, skill_text: str | None) -> str:
+    if not skill_text:
+        return base_prompt
+    return (
+        base_prompt
+        + "\n\nThe following required Skill is authoritative for the final result "
+        "shape. Apply it deterministically:\n<required-skill>\n"
+        + skill_text
+        + "\n</required-skill>"
+    )
+
+
+async def _run_protocol_correction(
+    request: str,
+    rejected_output: str,
+    error: str,
+    required_skill_text: str | None,
+) -> str:
+    correction_prompt = _with_required_skill(
+        """You are correcting only the final BLACKBOARD_RESULT v2 protocol line.
+Do not call tools, repeat investigation, change the assigned Intent, or add a
+new Intent. Use the original request and rejected output below. Return a
+corrected final response whose last protocol line passes the required Skill.""",
+        required_skill_text,
+    )
+    correction_request = (
+        request
+        + "\n\nProtocol validation error:\n"
+        + error
+        + "\n\nRejected provider output:\n<rejected-output>\n"
+        + rejected_output
+        + "\n</rejected-output>"
+    )
+    return await _run_without_tools(
+        correction_request,
+        _build_llm(),
+        correction_prompt,
+    )
+
+
+def _validate_provider_output(request: str, output: str) -> None:
+    from Skills.result_protocol import validate_payload
+
+    marker = "BLACKBOARD_RESULT:"
+    lines = [line for line in output.splitlines() if line.startswith(marker)]
+    if not lines:
+        raise ValueError("required BLACKBOARD_RESULT v2 line is missing")
+    payload = json.loads(lines[-1][len(marker):].strip())
+    match = re.search(r'"id"\s*:\s*"([^"]+)"', request)
+    if match is None:
+        raise ValueError("assigned intent id is missing from request")
+    try:
+        snapshot = json.JSONDecoder().raw_decode(request.split("Graph snapshot:\n", 1)[1])[0]
+    except (IndexError, json.JSONDecodeError) as exc:
+        raise ValueError("graph snapshot is missing from request") from exc
+    nodes = {
+        str(node["id"]): str(node["type"])
+        for node in snapshot.get("nodes", [])
+        if isinstance(node, dict) and "id" in node and "type" in node
+    }
+    goals = [node_id for node_id, node_type in nodes.items() if node_type == "goal"]
+    if not goals:
+        raise ValueError("current Goal is missing from request")
+    addresses = {
+        (str(edge["from_node"]), str(edge["to_node"]))
+        for edge in snapshot.get("edges", [])
+        if isinstance(edge, dict) and edge.get("type") == "addresses"
+        and "from_node" in edge and "to_node" in edge
+    }
+    validate_payload(payload, intent_id=match.group(1), goal_node_id=goals[-1], existing_nodes=nodes, existing_addresses=addresses)
+
+
 def _configure_standard_streams() -> None:
     """Enforce the UTF-8 process contract independently of the host locale."""
 
@@ -592,6 +690,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--challenge-dir", type=_optional_path_argument)
     parser.add_argument("--work-dir", type=_optional_path_argument)
+    parser.add_argument("--required-skill")
+    parser.add_argument("--result-protocol-version", type=int)
+    parser.add_argument("--capabilities", action="store_true")
+    parser.add_argument("--json", action="store_true")
     return parser
 
 
@@ -606,6 +708,30 @@ def main(argv: list[str] | None = None) -> int:
             print(f"qinyuan-agent health: {type(exc).__name__}: {exc}", file=sys.stderr)
             return 1
 
+    if args.capabilities:
+        manifest_path = Path(__file__).parent / "Skills" / "blackboard-result-protocol" / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        print(json.dumps({
+            "provider": "qinyuan-agent",
+            "provider_version": VERSION,
+            "request_protocol_versions": [1],
+            "result_protocol_versions": [1, 2],
+            "skill_mode": "required",
+            "available_skills": ["blackboard-result-protocol"],
+            "validates_result_locally": True,
+            "supports_result_fact": True,
+            "schema_version": manifest["schema_version"],
+            "fixture_digest": manifest["fixture_digest"],
+        }, ensure_ascii=False, sort_keys=True))
+        return 0
+    required_skill_text: str | None = None
+    if args.required_skill:
+        required_path = Path(__file__).parent / "Skills" / args.required_skill / "SKILL.md"
+        if not required_path.is_file():
+            print(f"qinyuan-agent: required skill unavailable: {args.required_skill}", file=sys.stderr)
+            return 2
+        required_skill_text = required_path.read_text(encoding="utf-8")
+
     request = sys.stdin.read()
     try:
         result = asyncio.run(
@@ -613,6 +739,7 @@ def main(argv: list[str] | None = None) -> int:
                 request,
                 challenge_dir=args.challenge_dir,
                 work_dir=args.work_dir,
+                required_skill_text=required_skill_text,
             )
         )
     except AgentInterrupted as exc:
@@ -624,6 +751,40 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     result = _normalize_provider_output(result)
+    if args.result_protocol_version == 2 and classify_request(request) != "planning":
+        try:
+            _validate_provider_output(request, result)
+        except (ValueError, json.JSONDecodeError) as exc:
+            print(
+                "qinyuan-agent: result protocol validation failed; requesting one correction",
+                file=sys.stderr,
+            )
+            try:
+                result = _normalize_provider_output(
+                    asyncio.run(
+                        _run_protocol_correction(
+                            request,
+                            result,
+                            str(exc),
+                            required_skill_text,
+                        )
+                    )
+                )
+                _validate_provider_output(request, result)
+            except (ValueError, json.JSONDecodeError) as correction_exc:
+                print(
+                    "qinyuan-agent: result protocol validation failed after correction: "
+                    f"{correction_exc}",
+                    file=sys.stderr,
+                )
+                return 1
+            except Exception as correction_exc:
+                print(
+                    "qinyuan-agent: protocol correction failed: "
+                    f"{type(correction_exc).__name__}: {correction_exc}",
+                    file=sys.stderr,
+                )
+                return 1
     try:
         sys.stdout.write(result)
         if not result.endswith("\n"):

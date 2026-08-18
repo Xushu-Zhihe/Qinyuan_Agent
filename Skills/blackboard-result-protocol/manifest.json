@@ -1,0 +1,6 @@
+{
+  "protocol_version": 2,
+  "schema_version": "2",
+  "fixture_digest": "sha256:aaee17602c77b77de5c955131472fa4510275c5f82ced1073247c0e0955e43e7",
+  "fixture_digest_algorithm": "sha256(sorted filename + NUL + trimmed UTF-8 content + LF)"
+}

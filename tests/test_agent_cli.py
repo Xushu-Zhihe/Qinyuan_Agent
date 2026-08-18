@@ -24,6 +24,7 @@ from agent import (
     AgentInterrupted,
     _execution_identity,
     _normalize_provider_output,
+    _run_protocol_correction,
     _optional_csv_environment,
     _optional_path_argument,
     _run_request_with_signal_handlers,
@@ -74,6 +75,22 @@ class _ToolResponse(_Response):
 
 
 class AgentCliTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _execution_request() -> str:
+        return (
+            EXECUTION_PREFIX
+            + '\nAssigned intent:\n{"id":"intent-1"}\n\n'
+            + 'Graph snapshot:\n{"nodes":[{"id":"goal-1","type":"goal"}],"edges":[]}'
+        )
+
+    @staticmethod
+    def _valid_v2_result() -> str:
+        return (
+            'BLACKBOARD_RESULT: '
+            '{"protocol_version":2,"intent_id":"intent-1","facts":[],'
+            '"edges":[],"goal_achieved":false,"goal_result_ref":null}'
+        )
+
     def test_prompts_distinguish_intent_completion_from_goal_completion(self) -> None:
         self.assertIn("An Intent being completed never means", PLANNING_SYSTEM_PROMPT)
         self.assertIn("There are two separate completion decisions", EXECUTION_SYSTEM_PROMPT)
@@ -420,6 +437,53 @@ class AgentCliTests(unittest.IsolatedAsyncioTestCase):
             raw_output.getvalue().decode("utf-8").splitlines(),
             ["BLACKBOARD_RESULT: {\"content\":\"中文\ufffd\"}"],
         )
+
+    def test_main_protocol_gate_retries_once_without_leaking_invalid_stdout(self) -> None:
+        invalid = "BLACKBOARD_RESULT: {}"
+        correction = self._valid_v2_result()
+        stdout = io.StringIO()
+        with (
+            patch.object(sys, "stdin", io.StringIO(self._execution_request())),
+            patch.object(sys, "stdout", stdout),
+            patch(
+                "agent._run_request_with_signal_handlers",
+                new=AsyncMock(return_value=invalid),
+            ),
+            patch(
+                "agent._run_protocol_correction",
+                new=AsyncMock(return_value=correction),
+            ) as retry,
+        ):
+            status = main(
+                [
+                    "--result-protocol-version",
+                    "2",
+                    "--required-skill",
+                    "blackboard-result-protocol",
+                ]
+            )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(stdout.getvalue(), correction + "\n")
+        retry.assert_awaited_once()
+
+    def test_main_protocol_gate_keeps_stdout_empty_after_second_failure(self) -> None:
+        with (
+            patch.object(sys, "stdin", io.StringIO(self._execution_request())),
+            patch.object(sys, "stdout", io.StringIO()) as stdout,
+            patch(
+                "agent._run_request_with_signal_handlers",
+                new=AsyncMock(return_value="BLACKBOARD_RESULT: {}"),
+            ),
+            patch(
+                "agent._run_protocol_correction",
+                new=AsyncMock(return_value="BLACKBOARD_RESULT: {}"),
+            ),
+        ):
+            status = main(["--result-protocol-version", "2"])
+
+        self.assertEqual(status, 1)
+        self.assertEqual(stdout.getvalue(), "")
 
     async def test_termination_signal_cancels_active_request(self) -> None:
         handlers = {}

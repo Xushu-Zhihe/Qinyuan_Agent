@@ -1,0 +1,1 @@
+{"protocol_version":2,"intent_id":"intent-1","facts":[{"ref":"result","content":"Final report."},{"ref":"evidence","content":"Verified evidence."}],"edges":[{"type":"addresses","from":"result","to":"goal-1"},{"type":"supports","from":"evidence","to":"result"}],"goal_achieved":true,"goal_result_ref":"result"}

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qinyuan.local/blackboard-result-v2.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol_version", "intent_id", "facts", "edges", "goal_achieved", "goal_result_ref"],
+  "properties": {
+    "protocol_version": {"const": 2},
+    "intent_id": {"type": "string", "minLength": 1},
+    "facts": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["ref", "content"], "properties": {"ref": {"type": "string", "minLength": 1}, "content": {"type": "string", "minLength": 1}}}},
+    "edges": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["type", "from", "to"], "properties": {"type": {"enum": ["supports", "contradicts", "derived_from", "addresses", "similar_to", "equivalent_to"]}, "from": {"type": "string", "minLength": 1}, "to": {"type": "string", "minLength": 1}}}},
+    "goal_achieved": {"type": "boolean"},
+    "goal_result_ref": {"type": ["string", "null"]}
+  }
+}
