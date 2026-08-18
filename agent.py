@@ -324,6 +324,18 @@ def _health_check() -> int:
     from dotenv import load_dotenv
 
     load_dotenv()
+    protocol_root = Path(__file__).parent / "Skills" / "blackboard-result-protocol"
+    required_protocol_files = (
+        protocol_root / "SKILL.md",
+        protocol_root / "protocol.schema.json",
+        protocol_root / "scripts" / "validate_result.py",
+        protocol_root / "manifest.json",
+    )
+    if not all(path.is_file() for path in required_protocol_files):
+        raise RuntimeError("blackboard protocol readiness: required resources are missing")
+    manifest = json.loads((protocol_root / "manifest.json").read_text(encoding="utf-8"))
+    if manifest.get("protocol_version") != 2:
+        raise RuntimeError("blackboard protocol readiness: protocol version mismatch")
     from MCPs.Mcp_client import load_registry, select_registry_servers
     from Sandbox.docker_runtime import DockerRuntime
     from Sandbox.settings import SandboxSettings
@@ -690,8 +702,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--challenge-dir", type=_optional_path_argument)
     parser.add_argument("--work-dir", type=_optional_path_argument)
-    parser.add_argument("--required-skill")
-    parser.add_argument("--result-protocol-version", type=int)
+    parser.add_argument("--required-skill", action="append")
+    parser.add_argument("--result-protocol-version", type=int, choices=(2,))
     parser.add_argument("--capabilities", action="store_true")
     parser.add_argument("--json", action="store_true")
     return parser
@@ -725,12 +737,17 @@ def main(argv: list[str] | None = None) -> int:
         }, ensure_ascii=False, sort_keys=True))
         return 0
     required_skill_text: str | None = None
-    if args.required_skill:
-        required_path = Path(__file__).parent / "Skills" / args.required_skill / "SKILL.md"
+    for skill_name in args.required_skill or ():
+        required_path = Path(__file__).parent / "Skills" / skill_name / "SKILL.md"
         if not required_path.is_file():
-            print(f"qinyuan-agent: required skill unavailable: {args.required_skill}", file=sys.stderr)
+            print(f"qinyuan-agent: required skill unavailable: {skill_name}", file=sys.stderr)
             return 2
-        required_skill_text = required_path.read_text(encoding="utf-8")
+        skill_text = required_path.read_text(encoding="utf-8").strip()
+        required_skill_text = (
+            skill_text
+            if required_skill_text is None
+            else required_skill_text + "\n\n" + skill_text
+        )
 
     request = sys.stdin.read()
     try:
