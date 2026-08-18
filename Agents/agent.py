@@ -410,6 +410,27 @@ class SkillAgentFactory:
                 require_blackboard_progress_before_final
             ),
         )
+
+    def create_from_prompt_with_skills(
+        self,
+        system_prompt: str,
+        required_skills: Sequence[str],
+        *,
+        tools: Optional[Sequence[str]] = None,
+        max_steps: int = 10,
+        require_tool_call_before_final: bool = False,
+        require_blackboard_progress_before_final: bool = False,
+    ) -> ToolCallingAgentRunner:
+        """Create an agent with deterministic, authoritative Skill text."""
+        skill_texts = [self.load_skill_md(name).strip() for name in required_skills]
+        combined = "\n\n".join(item for item in (system_prompt.strip(), *skill_texts) if item)
+        return self.create_from_prompt(
+            combined,
+            tools=tools,
+            max_steps=max_steps,
+            require_tool_call_before_final=require_tool_call_before_final,
+            require_blackboard_progress_before_final=require_blackboard_progress_before_final,
+        )
     
     def create(
         self,
@@ -421,8 +442,9 @@ class SkillAgentFactory:
     ) -> ToolCallingAgentRunner:
         """根据 SKILL.md 创建 Agent。"""
 
-        return self.create_from_prompt(
-            self.load_skill_md(skill_name),
+        return self.create_from_prompt_with_skills(
+            "",
+            (skill_name,),
             tools=tools,
             max_steps=max_steps,
             require_tool_call_before_final=require_tool_call_before_final,
