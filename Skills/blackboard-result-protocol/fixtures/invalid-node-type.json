@@ -1,0 +1,1 @@
+{"protocol_version":2,"intent_id":"intent-1","facts":[],"edges":[{"type":"addresses","from":"intent-1","to":"goal-1"}],"goal_achieved":true,"goal_result_ref":"intent-1"}
