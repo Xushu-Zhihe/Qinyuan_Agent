@@ -8,8 +8,27 @@ Qinyuan_Agent 是 qinyuan-bat 使用的 CLI solver provider。它接收一次 pl
 
 ```powershell
 python -m pip install -e .
-qinyuan-agent --required-skill blackboard-result-protocol --result-protocol-version 2 `
-  --challenge-dir C:\challenge --work-dir C:\work
+qinyuan-agent --required-skill blackboard-result-protocol --result-protocol-version 2 --challenge-dir .\challenge --work-dir .\work
+```
+
+安装对应沙盒并且验证：
+
+```powershell
+docker build `
+  --progress=plain `
+  --provenance=false `
+  --sbom=false `
+  --file Sandbox/dockerfile `
+  --tag qinyuan/pentest-sandbox:0.3.1 `
+  .
+qinyuan-agent --health
+```
+
+```powershell
+docker context use desktop-linux
+docker version
+docker info
+qinyuan-agent --health
 ```
 
 `--required-skill` 会确定性加载 `Skills/blackboard-result-protocol/SKILL.md`，`--result-protocol-version 2` 固定结果协议版本。最终 `BLACKBOARD_RESULT` 在写入 stdout 前由 vendored validator 校验；首次失败会对同一 Intent 追加一次 protocol correction，第二次失败才返回非零并把诊断留在 stderr。
