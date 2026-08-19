@@ -22,7 +22,7 @@ docker build `
   --provenance=false `
   --sbom=false `
   --file Sandbox/dockerfile `
-  --tag qinyuan/pentest-sandbox:0.3.1 `
+  --tag qinyuan/pentest-sandbox:0.3.2 `
   .
 qinyuan-agent --health
 ```

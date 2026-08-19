@@ -150,7 +150,7 @@ def classify_request(request: str) -> RequestMode:
 
 
 def _positive_steps() -> int:
-    raw = os.environ.get("QINYUAN_MAX_STEPS", "12")
+    raw = os.environ.get("QINYUAN_MAX_STEPS", "30")
     try:
         value = int(raw)
     except ValueError as exc:

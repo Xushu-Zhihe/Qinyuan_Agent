@@ -95,6 +95,60 @@
       "sandboxTools": ["bash", "pwsh"],
       "enabled": true
     },
+    "file": {
+      "transport": "stdio",
+      "command": "{python}",
+      "cwd": "../File_Mcp",
+      "args": ["server.py"],
+      "tags": ["reverse-engineering", "file-analysis"],
+      "sandboxTools": ["file"],
+      "enabled": true
+    },
+    "binutils": {
+      "transport": "stdio",
+      "command": "{python}",
+      "cwd": "../Binutils_Mcp",
+      "args": ["server.py"],
+      "tags": ["reverse-engineering", "elf-analysis"],
+      "sandboxTools": ["readelf", "objdump", "nm", "strings"],
+      "enabled": true
+    },
+    "gdb": {
+      "transport": "stdio",
+      "command": "{python}",
+      "cwd": "../Gdb_Mcp",
+      "args": ["server.py"],
+      "tags": ["reverse-engineering", "debugging", "pwn"],
+      "sandboxTools": ["gdb"],
+      "enabled": true
+    },
+    "pwntools": {
+      "transport": "stdio",
+      "command": "{python}",
+      "cwd": "../Pwntools_Mcp",
+      "args": ["server.py"],
+      "tags": ["pwn", "binary-exploitation"],
+      "sandboxTools": ["python3"],
+      "enabled": true
+    },
+    "z3": {
+      "transport": "stdio",
+      "command": "{python}",
+      "cwd": "../Z3_Mcp",
+      "args": ["server.py"],
+      "tags": ["constraints", "mathematics", "crypto"],
+      "sandboxTools": ["python3"],
+      "enabled": true
+    },
+    "pycryptodome": {
+      "transport": "stdio",
+      "command": "{python}",
+      "cwd": "../Pycryptodome_Mcp",
+      "args": ["server.py"],
+      "tags": ["cryptography", "mathematics"],
+      "sandboxTools": ["python3"],
+      "enabled": true
+    },
     "burp": {
       "transport": "stdio",
       "command": "{python}",

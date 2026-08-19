@@ -6,7 +6,7 @@ docker build `
   --provenance=false `
   --sbom=false `
   --file Sandbox/Dockerfile `
-  --tag qinyuan/pentest-sandbox:0.1.0 `
+  --tag qinyuan/pentest-sandbox:0.3.2 `
   .
 
 uv run python -m MCPs.Mcp_client.debug_client
