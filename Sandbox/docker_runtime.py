@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import re
-import uuid
+import time
 from contextlib import suppress
+from hashlib import sha256
+from typing import Callable, TypeVar
 
 import docker
-from docker.errors import APIError, ImageNotFound, NotFound
+import requests
+from docker.errors import APIError, DockerException, ImageNotFound, NotFound
 
 from Sandbox.models import CommandRequest, CommandResult, SandboxMounts
 from Sandbox.settings import SandboxSettings
+
+
+_T = TypeVar("_T")
 
 class DockerRuntimeError(RuntimeError):
     pass
@@ -27,6 +33,11 @@ def _connection_failure_message(error: BaseException) -> str:
     return f"Cannot connect to Docker: {detail}"
 
 
+def _compact_error(error: BaseException) -> str:
+    detail = " ".join(str(error).split())
+    return detail[:300] + ("..." if len(detail) > 300 else "")
+
+
 class DockerRuntime:
     def __init__(
         self,
@@ -38,11 +49,21 @@ class DockerRuntime:
 
         try:
             # 初始化阶段使用较短的超时。
-            client = docker.from_env(
-                timeout=self.settings.docker_connect_timeout_seconds
+            client = self._with_retries(
+                lambda: docker.DockerClient(
+                    base_url=self.settings.docker_host,
+                    version="auto",
+                    timeout=self.settings.docker_connect_timeout_seconds,
+                    max_pool_size=self.settings.docker_max_pool_size,
+                ),
+                action="connect to Docker daemon",
             )
+            client.api.trust_env = False
 
-            version_info = client.version()
+            version_info = self._with_retries(
+                client.version,
+                action="check Docker daemon version",
+            )
 
             if not isinstance(version_info, dict):
                 raise DockerRuntimeError(
@@ -77,12 +98,65 @@ class DockerRuntime:
 
             raise DockerRuntimeError(_connection_failure_message(error)) from error
 
+    def _with_retries(
+        self,
+        operation: Callable[[], _T],
+        *,
+        action: str,
+    ) -> _T:
+        """Retry only daemon transport and 5xx failures with bounded backoff."""
+
+        settings = getattr(self, "settings", None)
+        attempts = getattr(settings, "docker_operation_retries", 3)
+        backoff = getattr(settings, "docker_retry_backoff_seconds", 0.25)
+        for attempt in range(attempts):
+            try:
+                return operation()
+            except Exception as error:
+                if not self._is_transient(error):
+                    raise
+                if attempt + 1 >= attempts:
+                    raise DockerRuntimeError(
+                        f"Docker {action} failed after {attempts} attempts: "
+                        f"{_compact_error(error)}"
+                    ) from error
+                delay = backoff * (2**attempt)
+                if delay:
+                    time.sleep(delay)
+        raise AssertionError("unreachable retry loop")
+
+    @staticmethod
+    def _is_transient(error: BaseException) -> bool:
+        if isinstance(error, PermissionError):
+            return False
+        if isinstance(error, APIError):
+            status = getattr(error, "status_code", None)
+            return status is None or status >= 500
+        if isinstance(error, DockerException):
+            detail = str(error).lower()
+            return any(
+                marker in detail
+                for marker in ("eof", "timeout", "connection reset", "unavailable")
+            ) and "access denied" not in detail
+        return isinstance(
+            error,
+            (
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ReadTimeout,
+                requests.exceptions.ChunkedEncodingError,
+                TimeoutError,
+                OSError,
+            ),
+        )
+
     def create(self, agent_id: str, mounts: SandboxMounts) -> str:
         self._ensure_image_exists()
 
-        normalized_agent_id = self._normalize_agent_id(agent_id)
-        unique_id = uuid.uuid4().hex[:12]
-        container_name = f"qinyuan-{normalized_agent_id}-{unique_id}"
+        existing = self._adopt_existing(agent_id, mounts)
+        if existing is not None:
+            return existing
+
+        container_name = self._container_name(agent_id)
         tmpfs = {
             "/tmp": (
                 "rw,noexec,nosuid,nodev,"
@@ -111,46 +185,53 @@ class DockerRuntime:
 
         container = None
         try:
-            container = self.client.containers.run(
-                image=self.settings.image,
-                name=container_name,
-                command=["sleep", "infinity"],
-                detach=True,
-                auto_remove=False,
-                network=self.settings.network,
-                read_only=True,
-                tmpfs=tmpfs,
-                volumes=volumes or None,
-                cap_drop=["ALL"],
-                security_opt=["no-new-privileges:true"],
-                mem_limit=self.settings.memory_limit,
-                memswap_limit=self.settings.memory_swap_limit,
-                nano_cpus=self.settings.cpu_limit,
-                pids_limit=self.settings.process_limit,
-                user="10001:10001",
-                working_dir=working_dir,
-                environment={
-                    "HOME": "/tmp/qinyuan-home",
-                    "XDG_CACHE_HOME": "/tmp/qinyuan-cache",
-                    "XDG_CONFIG_HOME": "/tmp/qinyuan-config",
-                    "DOTNET_CLI_HOME": "/tmp/qinyuan-dotnet",
-                    "POWERSHELL_TELEMETRY_OPTOUT": "1",
-                },
-                labels={
-                    "qinyuan.managed": "true",
-                    "qinyuan.component": "sandbox",
-                    "qinyuan.agent_id": agent_id,
-                },
+            container = self._with_retries(
+                lambda: self.client.containers.run(
+                    image=self.settings.image,
+                    name=container_name,
+                    command=["sleep", "infinity"],
+                    detach=True,
+                    auto_remove=False,
+                    network=self.settings.network,
+                    read_only=True,
+                    tmpfs=tmpfs,
+                    volumes=volumes or None,
+                    cap_drop=["ALL"],
+                    security_opt=["no-new-privileges:true"],
+                    mem_limit=self.settings.memory_limit,
+                    memswap_limit=self.settings.memory_swap_limit,
+                    nano_cpus=self.settings.cpu_limit,
+                    pids_limit=self.settings.process_limit,
+                    user="10001:10001",
+                    working_dir=working_dir,
+                    environment={
+                        "HOME": "/tmp/qinyuan-home",
+                        "XDG_CACHE_HOME": "/tmp/qinyuan-cache",
+                        "XDG_CONFIG_HOME": "/tmp/qinyuan-config",
+                        "DOTNET_CLI_HOME": "/tmp/qinyuan-dotnet",
+                        "POWERSHELL_TELEMETRY_OPTOUT": "1",
+                    },
+                    labels={
+                        "qinyuan.managed": "true",
+                        "qinyuan.component": "sandbox",
+                        "qinyuan.agent_id": agent_id,
+                        "qinyuan.mount_fingerprint": self._mount_fingerprint(mounts),
+                    },
+                ),
+                action="create sandbox",
             )
 
-            container.reload()
+            self._with_retries(container.reload, action="inspect created sandbox")
 
             if container.status != "running":
-                logs = container.logs(
-                    stdout=True,
-                    stderr=True,
-                    tail=100,
-                ).decode("utf-8",errors="replace")
+                logs = self._with_retries(
+                    lambda: container.logs(
+                        stdout=True,
+                        stderr=True,
+                        tail=100,
+                    ),
+                    action="read sandbox startup logs",
+                ).decode("utf-8", errors="replace")
 
                 self.destroy(container.id)
 
@@ -160,16 +241,33 @@ class DockerRuntime:
 
             return container.id
 
-        except DockerRuntimeError:
-            raise
         except APIError as error:
+            # A second process may have won the deterministic-name race, or
+            # Docker may have returned EOF after creating the detached
+            # container. Adopt the already-running container instead of
+            # creating a second sandbox for the same Agent.
+            adopted = self._adopt_existing(agent_id, mounts)
+            if adopted is not None:
+                return adopted
             if container is not None:
                 with suppress(Exception):
                     container.remove(force=True)
+            detail = getattr(error, "explanation", None) or _compact_error(error)
             raise DockerRuntimeError(
-                f"Failed to create sandbox for agent {agent_id!r}:"
-                f"{error.explanation}"
+                f"Failed to create sandbox for agent {agent_id!r}: {detail}"
             ) from error
+        except DockerRuntimeError as error:
+            # _with_retries converts a final transport failure into a runtime
+            # error. The detached container may nevertheless exist server
+            # side, so check ownership before reporting failure.
+            if container is None or any(
+                marker in str(error)
+                for marker in ("create sandbox", "inspect created sandbox")
+            ):
+                adopted = self._adopt_existing(agent_id, mounts)
+                if adopted is not None:
+                    return adopted
+            raise
         except Exception as error:
             if container is not None:
                 with suppress(Exception):
@@ -177,6 +275,99 @@ class DockerRuntime:
             raise DockerRuntimeError(
                 f"Failed to initialize sandbox for agent {agent_id!r}"
             ) from error
+
+    def _adopt_existing(
+        self,
+        agent_id: str,
+        mounts: SandboxMounts,
+    ) -> str | None:
+        """Reuse the one running container owned by an Agent.
+
+        Stopped containers are safe to remove. Running containers are never
+        removed during startup cleanup, which prevents a second invocation from
+        deleting a live Agent sandbox and creating a replacement.
+        """
+
+        containers = self._managed_containers(agent_id)
+        running = []
+        for container in containers:
+            try:
+                self._with_retries(
+                    container.reload,
+                    action="inspect owned sandbox",
+                )
+            except NotFound:
+                continue
+            if getattr(container, "status", "") == "running":
+                running.append(container)
+            else:
+                self._remove_container(container)
+
+        if len(running) > 1:
+            ids = ", ".join(str(item.id) for item in running)
+            raise DockerRuntimeError(
+                f"Agent {agent_id!r} owns multiple running sandboxes: {ids}. "
+                "Stop the stale containers before retrying."
+            )
+        if not running:
+            return None
+
+        container = running[0]
+        labels = getattr(container, "labels", None) or {}
+        if not labels:
+            attrs = getattr(container, "attrs", {}) or {}
+            labels = (attrs.get("Config") or {}).get("Labels") or {}
+        fingerprint = labels.get("qinyuan.mount_fingerprint")
+        expected = self._mount_fingerprint(mounts)
+        if fingerprint is not None and fingerprint != expected:
+            raise DockerRuntimeError(
+                f"Agent {agent_id!r} already has a sandbox with different mounts"
+            )
+        return str(container.id)
+
+    def _managed_containers(self, agent_id: str) -> list[object]:
+        list_method = getattr(self.client.containers, "list", None)
+        if not callable(list_method):
+            return []
+        return list(
+            self._with_retries(
+                lambda: list_method(
+                    all=True,
+                    filters={
+                        "label": [
+                            "qinyuan.managed=true",
+                            "qinyuan.component=sandbox",
+                            f"qinyuan.agent_id={agent_id}",
+                        ]
+                    },
+                ),
+                action=f"find sandbox for agent {agent_id!r}",
+            )
+        )
+
+    def _remove_container(self, container: object) -> None:
+        remove = getattr(container, "remove", None)
+        if not callable(remove):
+            return
+        try:
+            self._with_retries(
+                lambda: remove(force=True),
+                action="remove sandbox",
+            )
+        except NotFound:
+            return
+
+    @classmethod
+    def _container_name(cls, agent_id: str) -> str:
+        normalized = cls._normalize_agent_id(agent_id)
+        identity = sha256(agent_id.encode("utf-8")).hexdigest()[:12]
+        return f"qinyuan-{normalized}-{identity}"
+
+    @staticmethod
+    def _mount_fingerprint(mounts: SandboxMounts) -> str:
+        challenge = str(mounts.challenge_dir or "")
+        work = str(mounts.work_dir or "")
+        return sha256(f"challenge={challenge}\nwork={work}".encode("utf-8")).hexdigest()
 
     def execute(
         self,
@@ -310,17 +501,28 @@ class DockerRuntime:
         """
 
         try:
-            container = self.client.containers.get(sandbox_id)
+            container = self._with_retries(
+                lambda: self.client.containers.get(sandbox_id),
+                action=f"find sandbox {sandbox_id!r}",
+            )
 
-            container.remove(force=True)
+            self._with_retries(
+                lambda: container.remove(force=True),
+                action=f"destroy sandbox {sandbox_id!r}",
+            )
 
         except NotFound:
-            return 
+            return
 
         except APIError as error:
             raise DockerRuntimeError(
                 f"Failed to destroy sandbox {sandbox_id!r}:"
                 f"{error.explanation}"
+            ) from error
+
+        except DockerRuntimeError as error:
+            raise DockerRuntimeError(
+                f"Failed to destroy sandbox {sandbox_id!r}: {error}"
             ) from error
 
     def cleanup_agent_containers(self, agent_id: str) -> tuple[str, ...]:
@@ -329,31 +531,21 @@ class DockerRuntime:
         normalized_agent_id = agent_id.strip()
         if not normalized_agent_id:
             raise ValueError("agent_id cannot be empty")
-        try:
-            containers = self.client.containers.list(
-                all=True,
-                filters={
-                    "label": [
-                        "qinyuan.managed=true",
-                        "qinyuan.component=sandbox",
-                        f"qinyuan.agent_id={normalized_agent_id}",
-                    ]
-                },
-            )
-            removed: list[str] = []
-            for container in containers:
-                container_id = str(container.id)
-                try:
-                    container.remove(force=True)
-                except NotFound:
-                    continue
-                removed.append(container_id)
-            return tuple(removed)
-        except APIError as error:
-            raise DockerRuntimeError(
-                f"Failed to clean stale sandboxes for agent {normalized_agent_id!r}: "
-                f"{error.explanation}"
-            ) from error
+        removed: list[str] = []
+        for container in self._managed_containers(normalized_agent_id):
+            try:
+                self._with_retries(
+                    container.reload,
+                    action="inspect stale sandbox",
+                )
+            except NotFound:
+                continue
+            if getattr(container, "status", "") == "running":
+                continue
+            container_id = str(container.id)
+            self._remove_container(container)
+            removed.append(container_id)
+        return tuple(removed)
 
     def close(self) -> None:
         """
@@ -376,21 +568,25 @@ class DockerRuntime:
         """
 
         try:
-            network = self.client.networks.get(
-                self.settings.network
+            network = self._with_retries(
+                lambda: self.client.networks.get(self.settings.network),
+                action=f"find Docker network {self.settings.network!r}",
             )
 
         except NotFound:
             try:
-                network = self.client.networks.create(
-                    name=self.settings.network,
-                    driver="bridge",
-                    internal=self.settings.network_internal,
-                    check_duplicate=True,
-                    labels={
-                        "qinyuan.managed":"true",
-                        "qinyuan.component":"sandbox-network",
-                    },
+                network = self._with_retries(
+                    lambda: self.client.networks.create(
+                        name=self.settings.network,
+                        driver="bridge",
+                        internal=self.settings.network_internal,
+                        check_duplicate=True,
+                        labels={
+                            "qinyuan.managed": "true",
+                            "qinyuan.component": "sandbox-network",
+                        },
+                    ),
+                    action=f"create Docker network {self.settings.network!r}",
                 )
 
 
@@ -401,11 +597,12 @@ class DockerRuntime:
                         f"{error.explanation}"
                     ) from error
 
-                network = self.client.networks.get(
-                    self.settings.network
+                network = self._with_retries(
+                    lambda: self.client.networks.get(self.settings.network),
+                    action=f"find Docker network {self.settings.network!r}",
                 )
 
-        network.reload()
+        self._with_retries(network.reload, action="inspect Docker network")
 
         actual_internal = bool(network.attrs.get("Internal", False))
         if actual_internal != self.settings.network_internal:
@@ -424,7 +621,10 @@ class DockerRuntime:
         """
 
         try:
-            self.client.images.get(self.settings.image)
+            self._with_retries(
+                lambda: self.client.images.get(self.settings.image),
+                action=f"find sandbox image {self.settings.image!r}",
+            )
 
         except ImageNotFound as error:
             raise DockerRuntimeError(
@@ -438,14 +638,20 @@ class DockerRuntime:
         """
 
         try:
-            container = self.client.containers.get(sandbox_id)
+            container = self._with_retries(
+                lambda: self.client.containers.get(sandbox_id),
+                action=f"find sandbox {sandbox_id!r}",
+            )
 
         except NotFound as error:
             raise DockerRuntimeError(
                 f"Sandbox {sandbox_id!r} does not exist"
             ) from error
 
-        container.reload()
+        self._with_retries(
+            container.reload,
+            action=f"inspect sandbox {sandbox_id!r}",
+        )
 
         if container.status != "running":
             raise DockerRuntimeError(

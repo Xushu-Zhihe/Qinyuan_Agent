@@ -24,10 +24,11 @@ py-modules = ["agent"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["Agents*", "LLMs*", "MCPs*", "Sandbox*", "Tools*", "Skills*"]
+include = ["Agents*", "LLMs*", "MCPs*", "Sandbox*", "Skills*", "tools*"]
 
 [tool.setuptools.package-data]
 Skills = ["**/*.md", "**/*.py", "**/*.json"]
+"MCPs.Mcp_client" = ["registry.json"]
 
 [tool.uv]
 package = true

@@ -7,6 +7,8 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
+import requests
+
 from MCPs.Mcp_client import load_registry, select_registry_servers
 from Sandbox.docker_runtime import DockerRuntime, DockerRuntimeError
 from Sandbox.models import SandboxMounts
@@ -72,7 +74,7 @@ class _FakeContainers:
 class SandboxConfigurationTests(unittest.TestCase):
     def test_docker_connection_error_preserves_underlying_cause(self) -> None:
         with patch(
-            "Sandbox.docker_runtime.docker.from_env",
+            "Sandbox.docker_runtime.docker.DockerClient",
             side_effect=PermissionError("access denied to Docker Desktop socket"),
         ):
             with self.assertRaisesRegex(
@@ -80,6 +82,41 @@ class SandboxConfigurationTests(unittest.TestCase):
                 "Cannot connect to Docker: access denied to Docker Desktop socket",
             ):
                 DockerRuntime(SandboxSettings())
+
+    def test_docker_client_uses_explicit_endpoint_without_parent_proxy(self) -> None:
+        client = MagicMock()
+        client.version.return_value = {"ApiVersion": "1.45"}
+        with patch(
+            "Sandbox.docker_runtime.docker.DockerClient",
+            return_value=client,
+        ) as docker_client, patch.object(DockerRuntime, "_ensure_network"):
+            DockerRuntime(
+                SandboxSettings(
+                    docker_host="npipe:////./pipe/dockerDesktopLinuxEngine",
+                )
+            )
+        docker_client.assert_called_once_with(
+            base_url="npipe:////./pipe/dockerDesktopLinuxEngine",
+            version="auto",
+            timeout=10,
+            max_pool_size=8,
+        )
+        self.assertFalse(client.api.trust_env)
+
+    def test_transient_docker_transport_failure_is_retried(self) -> None:
+        runtime = object.__new__(DockerRuntime)
+        runtime.settings = SandboxSettings(
+            docker_operation_retries=3,
+            docker_retry_backoff_seconds=0,
+        )
+        operation = MagicMock(
+            side_effect=[requests.exceptions.ConnectionError("EOF"), "ok"]
+        )
+        self.assertEqual(
+            runtime._with_retries(operation, action="test operation"),
+            "ok",
+        )
+        self.assertEqual(operation.call_count, 2)
 
     def test_mounts_resolve_sibling_directories(self) -> None:
         with _directories() as (_, challenge, work):
@@ -143,6 +180,30 @@ class SandboxConfigurationTests(unittest.TestCase):
                 "1",
             )
 
+    def test_docker_create_reuses_running_agent_container(self) -> None:
+        with _directories() as (_, challenge, work):
+            runtime = object.__new__(DockerRuntime)
+            runtime.settings = SandboxSettings()
+            existing = _FakeContainer()
+
+            class _ExistingContainers:
+                def list(self, **_kwargs):
+                    return [existing]
+
+                def run(self, **_kwargs):
+                    raise AssertionError("a second container must not be created")
+
+            runtime.client = type(
+                "Client",
+                (),
+                {"containers": _ExistingContainers()},
+            )()
+            with patch.object(runtime, "_ensure_image_exists"):
+                self.assertEqual(
+                    runtime.create("agent-1", SandboxMounts(challenge, work)),
+                    "container-1",
+                )
+
     def test_settings_read_validated_environment(self) -> None:
         environment = {
             "QINYUAN_SANDBOX_IMAGE": "example/sandbox:1",
@@ -160,6 +221,23 @@ class SandboxConfigurationTests(unittest.TestCase):
             frozenset({"nmap", "python3", "pwsh"}),
         )
 
+    def test_settings_pin_docker_endpoint_and_retry_policy(self) -> None:
+        environment = {
+            "QINYUAN_DOCKER_HOST": "npipe:////./pipe/dockerDesktopLinuxEngine",
+            "QINYUAN_DOCKER_MAX_POOL_SIZE": "4",
+            "QINYUAN_DOCKER_OPERATION_RETRIES": "5",
+            "QINYUAN_DOCKER_RETRY_BACKOFF_SECONDS": "0.1",
+        }
+        with patch.dict("os.environ", environment, clear=True):
+            settings = SandboxSettings.from_environment()
+        self.assertEqual(
+            settings.docker_host,
+            "npipe:////./pipe/dockerDesktopLinuxEngine",
+        )
+        self.assertEqual(settings.docker_max_pool_size, 4)
+        self.assertEqual(settings.docker_operation_retries, 5)
+        self.assertEqual(settings.docker_retry_backoff_seconds, 0.1)
+
     def test_settings_reject_invalid_network_mode(self) -> None:
         with patch.dict(
             "os.environ",
@@ -171,9 +249,11 @@ class SandboxConfigurationTests(unittest.TestCase):
 
     def test_orphan_cleanup_uses_all_ownership_labels(self) -> None:
         runtime = object.__new__(DockerRuntime)
+        runtime.settings = SandboxSettings()
         runtime.client = MagicMock()
         stale = MagicMock()
         stale.id = "stale-1"
+        stale.status = "exited"
         runtime.client.containers.list.return_value = [stale]
 
         removed = runtime.cleanup_agent_containers("agent-1")

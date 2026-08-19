@@ -319,10 +319,11 @@ def _build_llm() -> Any:
 
 
 def _health_check() -> int:
-    """Run dependency checks without loading an LLM or starting MCP tools."""
+    """Run dependency checks without loading an LLM or starting MCP servers."""
 
     from dotenv import load_dotenv
 
+    _load_execution_runtime()
     load_dotenv()
     protocol_root = Path(__file__).parent / "Skills" / "blackboard-result-protocol"
     required_protocol_files = (
@@ -351,24 +352,52 @@ def _health_check() -> int:
                 str(Path(__file__).parent / "MCPs" / "Mcp_client" / "registry.json"),
             )
         )
-        select_registry_servers(
+        selected = select_registry_servers(
             registry,
             _optional_csv_environment("QINYUAN_MCP_SERVERS"),
         )
+        missing_server_directories = sorted(
+            name
+            for name, config in selected.servers.items()
+            if config.enabled and config.cwd is not None and not config.cwd.is_dir()
+        )
+        if missing_server_directories:
+            raise RuntimeError(
+                "MCP registry readiness: server directories are missing for "
+                + ", ".join(missing_server_directories)
+            )
         required_servers = _optional_csv_environment(
             "QINYUAN_MCP_REQUIRED_SERVERS"
         )
         if required_servers:
-            selected = select_registry_servers(
-                registry,
-                _optional_csv_environment("QINYUAN_MCP_SERVERS"),
-            )
             select_registry_servers(selected, required_servers)
     finally:
         if runtime is not None:
             runtime.close()
     print("qinyuan-agent health: ok")
     return 0
+
+
+def _load_execution_runtime() -> tuple[Any, ...]:
+    """Import exactly the local packages required by the execution phase."""
+
+    from Agents.agent import SkillAgentFactory
+    from MCPs.Mcp_client import build_mcp_runtime
+    from Sandbox.docker_runtime import DockerRuntime
+    from Sandbox.models import SandboxMounts
+    from Sandbox.service import SandboxService
+    from Sandbox.settings import SandboxSettings
+    from tools import create_agent_tool_registry
+
+    return (
+        SkillAgentFactory,
+        build_mcp_runtime,
+        DockerRuntime,
+        SandboxMounts,
+        SandboxService,
+        SandboxSettings,
+        create_agent_tool_registry,
+    )
 
 
 async def _run_without_tools(
@@ -392,13 +421,15 @@ async def _run_with_tools(
     work_dir: Path | None,
     required_skill_text: str | None = None,
 ) -> str:
-    from Agents.agent import SkillAgentFactory
-    from MCPs.Mcp_client import build_mcp_runtime
-    from Sandbox.docker_runtime import DockerRuntime
-    from Sandbox.models import SandboxMounts
-    from Sandbox.service import SandboxService
-    from Sandbox.settings import SandboxSettings
-    from Tools import create_agent_tool_registry
+    (
+        SkillAgentFactory,
+        build_mcp_runtime,
+        DockerRuntime,
+        SandboxMounts,
+        SandboxService,
+        SandboxSettings,
+        create_agent_tool_registry,
+    ) = _load_execution_runtime()
 
     staged_logs = _stage_requested_execution_logs(request, work_dir)
     if staged_logs:
@@ -698,7 +729,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--health",
         action="store_true",
-        help="check Docker, sandbox image, and MCP registry configuration",
+        help=(
+            "check execution imports, Docker, sandbox image, and MCP registry "
+            "configuration"
+        ),
     )
     parser.add_argument("--challenge-dir", type=_optional_path_argument)
     parser.add_argument("--work-dir", type=_optional_path_argument)

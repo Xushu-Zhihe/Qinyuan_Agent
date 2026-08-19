@@ -44,6 +44,38 @@ def _configured_boolean(name: str, default: bool) -> bool:
     raise ValueError(f"{name} must be a boolean")
 
 
+def _configured_positive_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _configured_nonnegative_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw.strip())
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a non-negative number") from exc
+    if value < 0:
+        raise ValueError(f"{name} must be a non-negative number")
+    return value
+
+
+def _default_docker_host() -> str:
+    if os.name == "nt":
+        return "npipe:////./pipe/dockerDesktopLinuxEngine"
+    return "unix:///var/run/docker.sock"
+
+
 @dataclass(frozen=True)
 class SandboxSettings:
     image: str = "qinyuan/pentest-sandbox:0.3.1"
@@ -66,6 +98,13 @@ class SandboxSettings:
     # 命令最长可运行 300 秒，因此后续 Docker API 读取超时要更长。
     docker_api_timeout_seconds: int = 315
 
+    # Keep the Docker API endpoint independent from DOCKER_HOST and proxy
+    # variables inherited from a shell running Clash.
+    docker_host: str = field(default_factory=_default_docker_host)
+    docker_max_pool_size: int = 8
+    docker_operation_retries: int = 3
+    docker_retry_backoff_seconds: float = 0.25
+
     # 每个 stdout/stderr 最多在宿主机内存中保留 128 KiB。
     maximum_output_bytes_per_stream: int = 128 * 1024
 
@@ -86,6 +125,22 @@ class SandboxSettings:
                 "QINYUAN_SANDBOX_NETWORK_INTERNAL",
                 True,
             ),
+            docker_host=os.environ.get(
+                "QINYUAN_DOCKER_HOST",
+                _default_docker_host(),
+            ).strip(),
+            docker_max_pool_size=_configured_positive_int(
+                "QINYUAN_DOCKER_MAX_POOL_SIZE",
+                8,
+            ),
+            docker_operation_retries=_configured_positive_int(
+                "QINYUAN_DOCKER_OPERATION_RETRIES",
+                3,
+            ),
+            docker_retry_backoff_seconds=_configured_nonnegative_float(
+                "QINYUAN_DOCKER_RETRY_BACKOFF_SECONDS",
+                0.25,
+            ),
             allowed_tools=_configured_tools(),
         )
 
@@ -94,6 +149,18 @@ class SandboxSettings:
 
         if not self.image:
             raise ValueError("sandbox image must not be empty")
+
+        if not self.docker_host:
+            raise ValueError("docker_host must not be empty")
+
+        if self.docker_max_pool_size < 1:
+            raise ValueError("docker_max_pool_size must be positive")
+
+        if self.docker_operation_retries < 1:
+            raise ValueError("docker_operation_retries must be positive")
+
+        if self.docker_retry_backoff_seconds < 0:
+            raise ValueError("docker_retry_backoff_seconds must be non-negative")
 
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", self.network):
             raise ValueError("sandbox network name is invalid")

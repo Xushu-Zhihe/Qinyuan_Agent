@@ -23,6 +23,7 @@ from agent import (
     TIMEOUT_PREFIX,
     AgentInterrupted,
     _execution_identity,
+    _load_execution_runtime,
     _normalize_provider_output,
     _run_protocol_correction,
     _optional_csv_environment,
@@ -328,6 +329,12 @@ class AgentCliTests(unittest.IsolatedAsyncioTestCase):
             None,
             None,
         )
+
+    def test_execution_runtime_dependencies_import_together(self) -> None:
+        dependencies = _load_execution_runtime()
+
+        self.assertEqual(len(dependencies), 7)
+        self.assertTrue(all(dependency is not None for dependency in dependencies))
 
     async def test_empty_request_is_rejected_before_llm_creation(self) -> None:
         with patch("agent._build_llm") as build_llm:

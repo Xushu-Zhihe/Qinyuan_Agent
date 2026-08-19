@@ -8,8 +8,11 @@ Qinyuan_Agent 是 qinyuan-bat 使用的 CLI solver provider。它接收一次 pl
 
 ```powershell
 python -m pip install -e .
+python -I -c "from tools import create_agent_tool_registry; from MCPs.Mcp_client import load_registry; print('qinyuan-agent imports: ok')"
 qinyuan-agent --required-skill blackboard-result-protocol --result-protocol-version 2 --challenge-dir .\challenge --work-dir .\work
 ```
+
+`-I` 会从当前工作目录之外验证已安装包，避免源码目录碰巧可见而掩盖缺失的运行包或资源。`qinyuan-agent --health` 也会加载 Execution 所需模块，并检查启用的 MCP server 目录。
 
 安装对应沙盒并且验证：
 
