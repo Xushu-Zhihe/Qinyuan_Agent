@@ -253,6 +253,21 @@ class SandboxService:
         if errors:
             raise SandboxError("; ".join(errors))
 
+    def detach(self) -> None:
+        """Close this process' runtime connection without destroying sandboxes."""
+
+        with self._registry_lock:
+            if self._closed:
+                return
+            self._closed = True
+
+        try:
+            self.runtime.close()
+        finally:
+            with self._registry_lock:
+                self._sessions.clear()
+                self._agent_locks.clear()
+
     def _validate_command(self,request: CommandRequest) -> None:
 
         tool_name = request.tool.strip()

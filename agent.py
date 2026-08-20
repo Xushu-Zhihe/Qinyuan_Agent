@@ -199,12 +199,28 @@ def _execution_identity(work_dir: Path | None) -> str:
     return f"qinyuan-work-{digest}"
 
 
+_SANDBOX_OWNER_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,200}$")
+
+
+def _validated_sandbox_owner_id(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    if not _SANDBOX_OWNER_ID.fullmatch(normalized):
+        raise ValueError(
+            "sandbox owner ID must contain only letters, numbers, '.', '_', "
+            "':' or '-' and be at most 200 characters"
+        )
+    return normalized
+
+
 _RUN_DIRECTORY_REFERENCE = re.compile(r"\brun-qinyuan-agent-[A-Za-z0-9]+\b")
 
 
 def _stage_requested_execution_logs(
     request: str,
     work_dir: Path | None,
+    destination_dir: Path | None = None,
 ) -> tuple[str, ...]:
     """Stage explicitly referenced prior-run logs into the current work dir.
 
@@ -219,6 +235,7 @@ def _stage_requested_execution_logs(
         return ()
 
     current = work_dir.resolve()
+    destination = (destination_dir or work_dir).resolve()
     parent = current.parent
     staged: list[str] = []
     seen: set[str] = set()
@@ -230,7 +247,7 @@ def _stage_requested_execution_logs(
         if source == current or source.parent != parent or not source.is_dir():
             continue
 
-        target = current / "_previous_runs" / run_name
+        target = destination / "_previous_runs" / run_name
         copied = False
         for filename in ("stdout.txt", "stderr.txt"):
             source_file = source / filename
@@ -339,13 +356,21 @@ def _health_check() -> int:
         raise RuntimeError("blackboard protocol readiness: protocol version mismatch")
     from MCPs.Mcp_client import load_registry, select_registry_servers
     from Sandbox.docker_runtime import DockerRuntime
+    from Sandbox.models import SandboxMounts
     from Sandbox.settings import SandboxSettings
 
     settings = SandboxSettings.from_environment()
     runtime = None
+    probe_sandbox_id = None
     try:
         runtime = DockerRuntime(settings)
         runtime._ensure_image_exists()
+        probe_sandbox_id = runtime.create(
+            f"qinyuan-health-{uuid.uuid4().hex}",
+            SandboxMounts(),
+        )
+        runtime.destroy(probe_sandbox_id)
+        probe_sandbox_id = None
         registry = load_registry(
             os.environ.get(
                 "QINYUAN_MCP_REGISTRY",
@@ -373,6 +398,9 @@ def _health_check() -> int:
             select_registry_servers(selected, required_servers)
     finally:
         if runtime is not None:
+            if probe_sandbox_id is not None:
+                with suppress(Exception):
+                    runtime.destroy(probe_sandbox_id)
             runtime.close()
     print("qinyuan-agent health: ok")
     return 0
@@ -400,6 +428,19 @@ def _load_execution_runtime() -> tuple[Any, ...]:
     )
 
 
+def _release_sandbox_owner(owner_id: str) -> tuple[str, ...]:
+    """Destroy every sandbox held by one externally owned Agent lifecycle."""
+
+    from Sandbox.docker_runtime import DockerRuntime
+    from Sandbox.settings import SandboxSettings
+
+    runtime = DockerRuntime(SandboxSettings.from_environment())
+    try:
+        return runtime.destroy_agent_containers(owner_id)
+    finally:
+        runtime.close()
+
+
 async def _run_without_tools(
     request: str,
     llm: Any,
@@ -420,6 +461,9 @@ async def _run_with_tools(
     challenge_dir: Path | None,
     work_dir: Path | None,
     required_skill_text: str | None = None,
+    *,
+    sandbox_owner_id: str | None = None,
+    sandbox_work_dir: Path | None = None,
 ) -> str:
     (
         SkillAgentFactory,
@@ -431,7 +475,19 @@ async def _run_with_tools(
         create_agent_tool_registry,
     ) = _load_execution_runtime()
 
-    staged_logs = _stage_requested_execution_logs(request, work_dir)
+    if (sandbox_owner_id is None) != (sandbox_work_dir is None):
+        raise ValueError(
+            "sandbox owner ID and sandbox work directory must be provided together"
+        )
+    if sandbox_work_dir is not None:
+        sandbox_work_dir.mkdir(parents=True, exist_ok=True)
+    mounted_work_dir = sandbox_work_dir or work_dir
+
+    staged_logs = _stage_requested_execution_logs(
+        request,
+        work_dir,
+        mounted_work_dir,
+    )
     if staged_logs:
         print(
             "qinyuan-agent: staged prior execution logs: "
@@ -441,9 +497,9 @@ async def _run_with_tools(
 
     mounts = SandboxMounts(
         challenge_dir=challenge_dir,
-        work_dir=work_dir,
+        work_dir=mounted_work_dir,
     )
-    worker_id = _execution_identity(mounts.work_dir)
+    worker_id = sandbox_owner_id or _execution_identity(mounts.work_dir)
     runtime = None
     sandbox_service = None
     mcp_manager = None
@@ -510,7 +566,12 @@ async def _run_with_tools(
                 cleanup_errors.append(f"MCP cleanup failed: {exc}")
         if sandbox_service is not None:
             try:
-                await asyncio.to_thread(sandbox_service.close)
+                close_method = (
+                    sandbox_service.detach
+                    if sandbox_owner_id is not None
+                    else sandbox_service.close
+                )
+                await asyncio.to_thread(close_method)
             except Exception as exc:
                 cleanup_errors.append(f"sandbox cleanup failed: {exc}")
         elif runtime is not None:
@@ -529,6 +590,8 @@ async def run_request(
     challenge_dir: Path | None = None,
     work_dir: Path | None = None,
     required_skill_text: str | None = None,
+    sandbox_owner_id: str | None = None,
+    sandbox_work_dir: Path | None = None,
 ) -> str:
     """Run one stateless request using qinyuan-bat's existing protocol."""
 
@@ -549,12 +612,19 @@ async def run_request(
             configured_llm,
             _with_required_skill(TIMEOUT_SYSTEM_PROMPT, required_skill_text),
         )
+    lifecycle_arguments = {}
+    if sandbox_owner_id is not None or sandbox_work_dir is not None:
+        lifecycle_arguments = {
+            "sandbox_owner_id": sandbox_owner_id,
+            "sandbox_work_dir": sandbox_work_dir,
+        }
     if required_skill_text is None:
         return await _run_with_tools(
             request,
             configured_llm,
             challenge_dir,
             work_dir,
+            **lifecycle_arguments,
         )
     return await _run_with_tools(
         request,
@@ -562,6 +632,7 @@ async def run_request(
         challenge_dir,
         work_dir,
         required_skill_text,
+        **lifecycle_arguments,
     )
 
 
@@ -571,6 +642,8 @@ async def _run_request_with_signal_handlers(
     challenge_dir: Path | None,
     work_dir: Path | None,
     required_skill_text: str | None = None,
+    sandbox_owner_id: str | None = None,
+    sandbox_work_dir: Path | None = None,
 ) -> str:
     current_task = asyncio.current_task()
     if current_task is None:
@@ -608,6 +681,8 @@ async def _run_request_with_signal_handlers(
             challenge_dir=challenge_dir,
             work_dir=work_dir,
             required_skill_text=required_skill_text,
+            sandbox_owner_id=sandbox_owner_id,
+            sandbox_work_dir=sandbox_work_dir,
         )
     except asyncio.CancelledError as exc:
         if interrupted_by or cancelled_by_file:
@@ -736,6 +811,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--challenge-dir", type=_optional_path_argument)
     parser.add_argument("--work-dir", type=_optional_path_argument)
+    parser.add_argument("--sandbox-owner-id")
+    parser.add_argument("--sandbox-work-dir", type=_optional_path_argument)
+    parser.add_argument("--release-sandbox", action="store_true")
     parser.add_argument("--required-skill", action="append")
     parser.add_argument("--result-protocol-version", type=int, choices=(2,))
     parser.add_argument("--capabilities", action="store_true")
@@ -770,6 +848,39 @@ def main(argv: list[str] | None = None) -> int:
             "fixture_digest": manifest["fixture_digest"],
         }, ensure_ascii=False, sort_keys=True))
         return 0
+
+    try:
+        sandbox_owner_id = _validated_sandbox_owner_id(args.sandbox_owner_id)
+    except ValueError as exc:
+        print(f"qinyuan-agent: {exc}", file=sys.stderr)
+        return 2
+    if args.release_sandbox:
+        if sandbox_owner_id is None:
+            print(
+                "qinyuan-agent: --release-sandbox requires --sandbox-owner-id",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            removed = _release_sandbox_owner(sandbox_owner_id)
+        except Exception as exc:
+            print(
+                f"qinyuan-agent: sandbox release failed: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            f"qinyuan-agent: released {len(removed)} sandbox(es)",
+            file=sys.stderr,
+        )
+        return 0
+    if (sandbox_owner_id is None) != (args.sandbox_work_dir is None):
+        print(
+            "qinyuan-agent: --sandbox-owner-id and --sandbox-work-dir "
+            "must be provided together",
+            file=sys.stderr,
+        )
+        return 2
     required_skill_text: str | None = None
     for skill_name in args.required_skill or ():
         required_path = Path(__file__).parent / "Skills" / skill_name / "SKILL.md"
@@ -791,6 +902,8 @@ def main(argv: list[str] | None = None) -> int:
                 challenge_dir=args.challenge_dir,
                 work_dir=args.work_dir,
                 required_skill_text=required_skill_text,
+                sandbox_owner_id=sandbox_owner_id,
+                sandbox_work_dir=args.sandbox_work_dir,
             )
         )
     except AgentInterrupted as exc:

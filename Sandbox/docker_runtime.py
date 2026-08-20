@@ -186,11 +186,10 @@ class DockerRuntime:
         container = None
         try:
             container = self._with_retries(
-                lambda: self.client.containers.run(
+                lambda: self.client.containers.create(
                     image=self.settings.image,
                     name=container_name,
                     command=["sleep", "infinity"],
-                    detach=True,
                     auto_remove=False,
                     network=self.settings.network,
                     read_only=True,
@@ -219,6 +218,15 @@ class DockerRuntime:
                     },
                 ),
                 action="create sandbox",
+            )
+
+            # Creating and starting are separate Docker operations. Retrying
+            # containers.run() after a start-side 5xx attempts to create the
+            # deterministic name again and hides the original runtime error
+            # behind a misleading name conflict.
+            self._with_retries(
+                container.start,
+                action="start sandbox",
             )
 
             self._with_retries(container.reload, action="inspect created sandbox")
@@ -262,11 +270,21 @@ class DockerRuntime:
             # side, so check ownership before reporting failure.
             if container is None or any(
                 marker in str(error)
-                for marker in ("create sandbox", "inspect created sandbox")
+                for marker in (
+                    "create sandbox",
+                    "start sandbox",
+                    "inspect created sandbox",
+                )
             ):
                 adopted = self._adopt_existing(agent_id, mounts)
                 if adopted is not None:
                     return adopted
+                # _adopt_existing removes a matching non-running container.
+                # Avoid issuing a second removal for the same object below.
+                container = None
+            if container is not None:
+                with suppress(Exception):
+                    container.remove(force=True)
             raise
         except Exception as error:
             if container is not None:
@@ -542,6 +560,19 @@ class DockerRuntime:
                 continue
             if getattr(container, "status", "") == "running":
                 continue
+            container_id = str(container.id)
+            self._remove_container(container)
+            removed.append(container_id)
+        return tuple(removed)
+
+    def destroy_agent_containers(self, agent_id: str) -> tuple[str, ...]:
+        """Remove every container owned by one logical Agent lifecycle."""
+
+        normalized_agent_id = agent_id.strip()
+        if not normalized_agent_id:
+            raise ValueError("agent_id cannot be empty")
+        removed: list[str] = []
+        for container in self._managed_containers(normalized_agent_id):
             container_id = str(container.id)
             self._remove_container(container)
             removed.append(container_id)

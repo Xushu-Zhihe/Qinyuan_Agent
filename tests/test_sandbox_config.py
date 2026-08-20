@@ -58,6 +58,12 @@ class _FakeContainer:
     id = "container-1"
     status = "running"
 
+    def __init__(self) -> None:
+        self.start_calls = 0
+
+    def start(self):
+        self.start_calls += 1
+
     def reload(self):
         return None
 
@@ -66,7 +72,7 @@ class _FakeContainers:
     def __init__(self) -> None:
         self.kwargs = None
 
-    def run(self, **kwargs):
+    def create(self, **kwargs):
         self.kwargs = kwargs
         return _FakeContainer()
 
@@ -152,6 +158,21 @@ class SandboxConfigurationTests(unittest.TestCase):
             self.assertEqual(runtime.destroyed, ["sandbox-1"])
             self.assertTrue(runtime.closed)
 
+    def test_service_detach_keeps_sandbox_for_next_process(self) -> None:
+        with _directories() as (_, challenge, work):
+            runtime = _FakeRuntime()
+            service = SandboxService(runtime)
+            service.start_for_agent(
+                "agent-1",
+                SandboxMounts(challenge, work),
+            )
+
+            service.detach()
+
+            self.assertEqual(runtime.destroyed, [])
+            self.assertTrue(runtime.closed)
+            self.assertIsNone(service.get_session("agent-1"))
+
     def test_docker_create_uses_readonly_challenge_and_writable_work(self) -> None:
         with _directories() as (_, challenge, work):
             runtime = object.__new__(DockerRuntime)
@@ -180,6 +201,59 @@ class SandboxConfigurationTests(unittest.TestCase):
                 "1",
             )
 
+    def test_docker_start_retry_reuses_the_created_container(self) -> None:
+        runtime = object.__new__(DockerRuntime)
+        runtime.settings = SandboxSettings(
+            docker_operation_retries=3,
+            docker_retry_backoff_seconds=0,
+        )
+        container = MagicMock()
+        container.id = "sandbox-1"
+        container.status = "running"
+        container.start.side_effect = [
+            requests.exceptions.ConnectionError("temporary start failure"),
+            None,
+        ]
+        runtime.client = MagicMock()
+        runtime.client.containers.create.return_value = container
+
+        with patch.object(runtime, "_ensure_image_exists"):
+            sandbox_id = runtime.create("agent-1", SandboxMounts())
+
+        self.assertEqual(sandbox_id, "sandbox-1")
+        runtime.client.containers.create.assert_called_once()
+        self.assertEqual(container.start.call_count, 2)
+        container.remove.assert_not_called()
+
+    def test_docker_start_failure_preserves_root_error_without_recreating(self) -> None:
+        runtime = object.__new__(DockerRuntime)
+        runtime.settings = SandboxSettings(
+            docker_operation_retries=3,
+            docker_retry_backoff_seconds=0,
+        )
+        container = MagicMock()
+        container.id = "sandbox-1"
+        container.status = "created"
+        container.start.side_effect = requests.exceptions.ConnectionError(
+            "failed to start shim: SIGILL: illegal instruction"
+        )
+        runtime.client = MagicMock()
+        runtime.client.containers.create.return_value = container
+        runtime.client.containers.list.side_effect = [[], [container]]
+
+        with (
+            patch.object(runtime, "_ensure_image_exists"),
+            self.assertRaisesRegex(
+                DockerRuntimeError,
+                "start sandbox failed after 3 attempts.*SIGILL",
+            ),
+        ):
+            runtime.create("agent-1", SandboxMounts())
+
+        runtime.client.containers.create.assert_called_once()
+        self.assertEqual(container.start.call_count, 3)
+        container.remove.assert_called_once_with(force=True)
+
     def test_docker_create_reuses_running_agent_container(self) -> None:
         with _directories() as (_, challenge, work):
             runtime = object.__new__(DockerRuntime)
@@ -190,7 +264,7 @@ class SandboxConfigurationTests(unittest.TestCase):
                 def list(self, **_kwargs):
                     return [existing]
 
-                def run(self, **_kwargs):
+                def create(self, **_kwargs):
                     raise AssertionError("a second container must not be created")
 
             runtime.client = type(
@@ -270,6 +344,20 @@ class SandboxConfigurationTests(unittest.TestCase):
             },
         )
         stale.remove.assert_called_once_with(force=True)
+
+    def test_explicit_owner_release_removes_running_sandbox(self) -> None:
+        runtime = object.__new__(DockerRuntime)
+        runtime.settings = SandboxSettings()
+        runtime.client = MagicMock()
+        running = MagicMock()
+        running.id = "running-1"
+        running.status = "running"
+        runtime.client.containers.list.return_value = [running]
+
+        removed = runtime.destroy_agent_containers("agent-1")
+
+        self.assertEqual(removed, ("running-1",))
+        running.remove.assert_called_once_with(force=True)
 
     def test_mcp_server_allowlist_only_restricts_enabled_registry(self) -> None:
         registry = load_registry(REGISTRY)

@@ -12,6 +12,14 @@ python -I -c "from tools import create_agent_tool_registry; from MCPs.Mcp_client
 qinyuan-agent --required-skill blackboard-result-protocol --result-protocol-version 2 --challenge-dir .\challenge --work-dir .\work
 ```
 
+For project-owned sandboxes, qinyuan-bat also supplies
+`--sandbox-owner-id <stable-owner>` and `--sandbox-work-dir <stable-workspace>`.
+Those short-lived provider processes detach without deleting the sandbox. The
+project owner releases it explicitly with
+`qinyuan-agent --release-sandbox --sandbox-owner-id <stable-owner>` after the
+solver project reaches its terminal state. Calls without these lifecycle
+arguments retain the original per-process cleanup behavior.
+
 `-I` 会从当前工作目录之外验证已安装包，避免源码目录碰巧可见而掩盖缺失的运行包或资源。`qinyuan-agent --health` 也会加载 Execution 所需模块，并检查启用的 MCP server 目录。
 
 安装对应沙盒并且验证：

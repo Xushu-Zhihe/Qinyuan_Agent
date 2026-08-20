@@ -7,7 +7,7 @@ import signal
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from Agents.agent import (
     PROJECT_ROOT,
@@ -23,6 +23,7 @@ from agent import (
     TIMEOUT_PREFIX,
     AgentInterrupted,
     _execution_identity,
+    _health_check,
     _load_execution_runtime,
     _normalize_provider_output,
     _run_protocol_correction,
@@ -97,6 +98,29 @@ class AgentCliTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("There are two separate completion decisions", EXECUTION_SYSTEM_PROMPT)
         self.assertIn("goal_achieved` to false", EXECUTION_SYSTEM_PROMPT)
         self.assertIn("whole Goal", TIMEOUT_SYSTEM_PROMPT)
+
+    def test_health_check_starts_and_removes_probe_sandbox(self) -> None:
+        runtime = MagicMock()
+        runtime.create.return_value = "sandbox-health"
+
+        with (
+            patch(
+                "Sandbox.docker_runtime.DockerRuntime",
+                return_value=runtime,
+            ),
+            patch("sys.stdout", io.StringIO()),
+        ):
+            status = _health_check()
+
+        self.assertEqual(status, 0)
+        runtime._ensure_image_exists.assert_called_once_with()
+        runtime.create.assert_called_once()
+        owner_id, mounts = runtime.create.call_args.args
+        self.assertRegex(owner_id, r"^qinyuan-health-[0-9a-f]{32}$")
+        self.assertIsNone(mounts.challenge_dir)
+        self.assertIsNone(mounts.work_dir)
+        runtime.destroy.assert_called_once_with("sandbox-health")
+        runtime.close.assert_called_once_with()
 
     def test_classifies_qinyuan_bat_request_headers(self) -> None:
         self.assertEqual(classify_request(PLANNING_PREFIX + "\nbody"), "planning")
@@ -329,6 +353,54 @@ class AgentCliTests(unittest.IsolatedAsyncioTestCase):
             None,
             None,
         )
+
+    async def test_execution_passes_stable_sandbox_lifecycle_to_runtime(self) -> None:
+        llm = _FakeLLM("unused")
+        sandbox_work = Path(__file__).resolve().parent / ".sandbox-work"
+        with patch(
+            "agent._run_with_tools",
+            new=AsyncMock(return_value="BLACKBOARD_RESULT: {}"),
+        ) as run_with_tools:
+            result = await run_request(
+                EXECUTION_PREFIX + "\nbody",
+                llm=llm,
+                sandbox_owner_id="qinyuan-bat:project-1:qinyuan-agent",
+                sandbox_work_dir=sandbox_work,
+            )
+
+        self.assertEqual(result, "BLACKBOARD_RESULT: {}")
+        run_with_tools.assert_awaited_once_with(
+            EXECUTION_PREFIX + "\nbody",
+            llm,
+            None,
+            None,
+            sandbox_owner_id="qinyuan-bat:project-1:qinyuan-agent",
+            sandbox_work_dir=sandbox_work,
+        )
+
+    def test_release_sandbox_cli_uses_explicit_owner(self) -> None:
+        stderr = io.StringIO()
+        with (
+            patch("agent._release_sandbox_owner", return_value=("sandbox-1",)) as release,
+            patch("sys.stderr", stderr),
+        ):
+            status = main(
+                [
+                    "--release-sandbox",
+                    "--sandbox-owner-id",
+                    "qinyuan-bat:project-1:qinyuan-agent",
+                ]
+            )
+
+        self.assertEqual(status, 0)
+        release.assert_called_once_with("qinyuan-bat:project-1:qinyuan-agent")
+        self.assertIn("released 1 sandbox", stderr.getvalue())
+
+    def test_persistent_sandbox_arguments_must_be_paired(self) -> None:
+        with patch("sys.stderr", io.StringIO()):
+            status = main(["--sandbox-owner-id", "project-1"])
+
+        self.assertEqual(status, 2)
 
     def test_execution_runtime_dependencies_import_together(self) -> None:
         dependencies = _load_execution_runtime()

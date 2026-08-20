@@ -25,6 +25,89 @@ AUTHORIZED_TARGET_URL = os.environ.get("QINYUAN_AUTHORIZED_TARGET_URL", "")
 
 @unittest.skipUnless(RUN_DOCKER_TESTS, "set QINYUAN_RUN_DOCKER_TESTS=1")
 class DockerRuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_process_handoff_reuses_sandbox_until_explicit_release(self) -> None:
+        owner_id = f"integration-handoff-{uuid4().hex}"
+        root = Path(__file__).resolve().parent / ".runtime-work" / uuid4().hex
+        work = root / "work"
+        work.mkdir(parents=True)
+        first_service = None
+        second_service = None
+        try:
+            mounts = SandboxMounts(work_dir=work)
+            first_service = SandboxService(await asyncio.to_thread(DockerRuntime))
+            first = await asyncio.to_thread(
+                first_service.start_for_agent,
+                owner_id,
+                mounts,
+            )
+            written = await asyncio.to_thread(
+                first_service.execute,
+                owner_id,
+                CommandRequest(
+                    "python3",
+                    (
+                        "-c",
+                        "from pathlib import Path; "
+                        "Path('handoff.txt').write_text('ok')",
+                    ),
+                ),
+            )
+            self.assertEqual(written.exit_code, 0, written.stderr)
+            await asyncio.to_thread(first_service.detach)
+            first_service = None
+
+            second_service = SandboxService(await asyncio.to_thread(DockerRuntime))
+            second = await asyncio.to_thread(
+                second_service.start_for_agent,
+                owner_id,
+                mounts,
+            )
+            self.assertEqual(second.sandbox_id, first.sandbox_id)
+            read = await asyncio.to_thread(
+                second_service.execute,
+                owner_id,
+                CommandRequest(
+                    "python3",
+                    (
+                        "-c",
+                        "from pathlib import Path; "
+                        "print(Path('handoff.txt').read_text())",
+                    ),
+                ),
+            )
+            self.assertEqual(read.exit_code, 0, read.stderr)
+            self.assertEqual(read.stdout.strip(), "ok")
+            await asyncio.to_thread(second_service.detach)
+            second_service = None
+
+            release_runtime = await asyncio.to_thread(DockerRuntime)
+            try:
+                removed = await asyncio.to_thread(
+                    release_runtime.destroy_agent_containers,
+                    owner_id,
+                )
+            finally:
+                await asyncio.to_thread(release_runtime.close)
+            self.assertEqual(removed, (first.sandbox_id,))
+        finally:
+            if first_service is not None:
+                await asyncio.to_thread(first_service.detach)
+            if second_service is not None:
+                await asyncio.to_thread(second_service.detach)
+            cleanup_runtime = await asyncio.to_thread(DockerRuntime)
+            try:
+                await asyncio.to_thread(
+                    cleanup_runtime.destroy_agent_containers,
+                    owner_id,
+                )
+            finally:
+                await asyncio.to_thread(cleanup_runtime.close)
+            shutil.rmtree(root, ignore_errors=True)
+            try:
+                root.parent.rmdir()
+            except OSError:
+                pass
+
     async def test_bound_mcp_tool_executes_in_dedicated_sandbox(self) -> None:
         agent_id = "integration-mcp"
         service = SandboxService(await asyncio.to_thread(DockerRuntime))
