@@ -4,6 +4,7 @@ import re
 import time
 from contextlib import suppress
 from hashlib import sha256
+from threading import Lock
 from typing import Callable, TypeVar
 
 import docker
@@ -75,10 +76,14 @@ class DockerRuntime:
                     "Docker version response does not contain ApiVersion"
                 )
 
-            # 初始化完成后，将 API 超时调整为能够覆盖最长工具执行时间。
-            client.api.timeout = self.settings.docker_api_timeout_seconds
+            # 控制面必须快速失败。长命令输出使用按需创建的独立客户端。
+            client.api.timeout = self.settings.docker_control_timeout_seconds
 
             self.client = client
+            self._stream_client = None
+            self._stream_client_lock = Lock()
+            self._active_output_streams: dict[str, object] = {}
+            self._active_output_streams_lock = Lock()
             self._ensure_network()
 
         except DockerRuntimeError:
@@ -124,6 +129,43 @@ class DockerRuntime:
                 if delay:
                     time.sleep(delay)
         raise AssertionError("unreachable retry loop")
+
+    def _stream_api(self):
+        """Return the long-timeout API client used only for exec output."""
+
+        with self._stream_client_lock:
+            if self._stream_client is None:
+                client = docker.DockerClient(
+                    base_url=self.settings.docker_host,
+                    version=self.client.api.api_version,
+                    timeout=self.settings.docker_api_timeout_seconds,
+                    max_pool_size=self.settings.docker_max_pool_size,
+                )
+                client.api.trust_env = False
+                self._stream_client = client
+            return self._stream_client.api
+
+    def _register_output_stream(self, sandbox_id: str, stream: object) -> None:
+        with self._active_output_streams_lock:
+            self._active_output_streams[sandbox_id] = stream
+
+    def _close_output_stream(
+        self,
+        sandbox_id: str,
+        *,
+        expected: object | None = None,
+    ) -> None:
+        """Close one active Docker socket so its reader can leave the host thread."""
+
+        with self._active_output_streams_lock:
+            stream = self._active_output_streams.get(sandbox_id)
+            if stream is None or (expected is not None and stream is not expected):
+                return
+            self._active_output_streams.pop(sandbox_id, None)
+
+        close_stream = getattr(stream, "close", None)
+        if callable(close_stream):
+            close_stream()
 
     @staticmethod
     def _is_transient(error: BaseException) -> bool:
@@ -259,7 +301,7 @@ class DockerRuntime:
                 return adopted
             if container is not None:
                 with suppress(Exception):
-                    container.remove(force=True)
+                    self._remove_container(container)
             detail = getattr(error, "explanation", None) or _compact_error(error)
             raise DockerRuntimeError(
                 f"Failed to create sandbox for agent {agent_id!r}: {detail}"
@@ -284,12 +326,12 @@ class DockerRuntime:
                 container = None
             if container is not None:
                 with suppress(Exception):
-                    container.remove(force=True)
+                    self._remove_container(container)
             raise
         except Exception as error:
             if container is not None:
                 with suppress(Exception):
-                    container.remove(force=True)
+                    self._remove_container(container)
             raise DockerRuntimeError(
                 f"Failed to initialize sandbox for agent {agent_id!r}"
             ) from error
@@ -364,16 +406,51 @@ class DockerRuntime:
         )
 
     def _remove_container(self, container: object) -> None:
+        try:
+            self._with_retries(
+                container.reload,
+                action="inspect sandbox before removal",
+            )
+        except NotFound:
+            return
+        if getattr(container, "status", "") == "running":
+            self._stop_container(container)
+
         remove = getattr(container, "remove", None)
         if not callable(remove):
             return
         try:
             self._with_retries(
-                lambda: remove(force=True),
+                lambda: remove(force=False),
                 action="remove sandbox",
             )
         except NotFound:
             return
+
+    def _stop_container(self, container: object) -> None:
+        stop = getattr(container, "stop", None)
+        if not callable(stop):
+            raise DockerRuntimeError("Docker container does not support stop")
+        try:
+            # Stop is destructive and may still be running inside Docker after
+            # the client times out. Retrying it creates overlapping kill
+            # requests against the same containerd task.
+            stop(
+                timeout=self.settings.docker_stop_timeout_seconds,
+            )
+            self._with_retries(container.reload, action="inspect stopped sandbox")
+        except NotFound:
+            return
+        except DockerRuntimeError:
+            raise
+        except Exception as error:
+            raise DockerRuntimeError(
+                f"Docker stop sandbox failed: {_compact_error(error)}"
+            ) from error
+        if getattr(container, "status", "") == "running":
+            raise DockerRuntimeError(
+                f"Sandbox {getattr(container, 'id', 'unknown')!r} is still running"
+            )
 
     @classmethod
     def _container_name(cls, agent_id: str) -> str:
@@ -446,13 +523,14 @@ class DockerRuntime:
                     "Docker did not return a valid exec ID"
                 )
 
-            output_stream = self.client.api.exec_start(
+            output_stream = self._stream_api().exec_start(
                 exec_id=exec_id,
                 detach=False,
                 tty=False,
                 stream=True,
                 demux=True,
             )
+            self._register_output_stream(sandbox_id, output_stream)
 
             for output in output_stream:
                 if isinstance(output, tuple):
@@ -490,9 +568,10 @@ class DockerRuntime:
 
         finally:
             if output_stream is not None:
-                close_stream = getattr(output_stream, "close", None)
-                if callable(close_stream):
-                    close_stream()
+                self._close_output_stream(
+                    sandbox_id,
+                    expected=output_stream,
+                )
 
         stdout_bytes, stdout_truncated = stdout_buffer.render()
         stderr_bytes, stderr_truncated = stderr_buffer.render()
@@ -510,9 +589,45 @@ class DockerRuntime:
             stderr_truncated=stderr_truncated,
         )
 
+    def interrupt(self, sandbox_id: str) -> None:
+        """Stop a sandbox so Docker can close active exec streams safely."""
+
+        stream_error: Exception | None = None
+        try:
+            # This is the host-side cancellation boundary. It releases the
+            # Python reader even when containerd never emits an exit event.
+            self._close_output_stream(sandbox_id)
+        except Exception as error:
+            stream_error = error
+
+        try:
+            container = self._with_retries(
+                lambda: self.client.containers.get(sandbox_id),
+                action=f"find sandbox {sandbox_id!r}",
+            )
+            self._with_retries(container.reload, action="inspect sandbox to interrupt")
+            if getattr(container, "status", "") == "running":
+                self._stop_container(container)
+        except NotFound:
+            if stream_error is None:
+                return
+        except APIError as error:
+            raise DockerRuntimeError(
+                f"Failed to interrupt sandbox {sandbox_id!r}: {error.explanation}"
+            ) from error
+        except DockerRuntimeError as error:
+            raise DockerRuntimeError(
+                f"Failed to interrupt sandbox {sandbox_id!r}: {error}"
+            ) from error
+        if stream_error is not None:
+            raise DockerRuntimeError(
+                f"Failed to close sandbox {sandbox_id!r} output stream: "
+                f"{_compact_error(stream_error)}"
+            ) from stream_error
+
     def destroy(self,sandbox_id: str) -> None:
         """
-        强制停止并删除 Docker容器。
+        先停止再删除 Docker 容器。
 
         如果容器已经不存在，直接返回。
         因此该方法可以安全地重复调用。
@@ -524,10 +639,7 @@ class DockerRuntime:
                 action=f"find sandbox {sandbox_id!r}",
             )
 
-            self._with_retries(
-                lambda: container.remove(force=True),
-                action=f"destroy sandbox {sandbox_id!r}",
-            )
+            self._remove_container(container)
 
         except NotFound:
             return
@@ -586,6 +698,15 @@ class DockerRuntime:
         SandboxService.close() 会先执行 stop_all()
         然后再调用这个方法
         """
+        active_streams = tuple(
+            getattr(self, "_active_output_streams", {}).keys()
+        )
+        for sandbox_id in active_streams:
+            with suppress(Exception):
+                self._close_output_stream(sandbox_id)
+        stream_client = getattr(self, "_stream_client", None)
+        if stream_client is not None:
+            stream_client.close()
         self.client.close()
 
     def _ensure_network(self) -> None:

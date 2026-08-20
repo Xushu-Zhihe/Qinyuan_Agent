@@ -18,6 +18,10 @@ class SandboxRuntime(Protocol):
         """Execute one command inside a sandbox."""
         ...
 
+    def interrupt(self, sandbox_id: str) -> None:
+        """Stop a sandbox without deleting it while output may still be active."""
+        ...
+
     def destroy(self, sandbox_id: str) -> None:
         """Destroy one sandbox."""
         ...

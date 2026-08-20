@@ -99,9 +99,8 @@ class AgentCliTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("goal_achieved` to false", EXECUTION_SYSTEM_PROMPT)
         self.assertIn("whole Goal", TIMEOUT_SYSTEM_PROMPT)
 
-    def test_health_check_starts_and_removes_probe_sandbox(self) -> None:
+    def test_health_check_does_not_churn_probe_containers(self) -> None:
         runtime = MagicMock()
-        runtime.create.return_value = "sandbox-health"
 
         with (
             patch(
@@ -114,12 +113,8 @@ class AgentCliTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(status, 0)
         runtime._ensure_image_exists.assert_called_once_with()
-        runtime.create.assert_called_once()
-        owner_id, mounts = runtime.create.call_args.args
-        self.assertRegex(owner_id, r"^qinyuan-health-[0-9a-f]{32}$")
-        self.assertIsNone(mounts.challenge_dir)
-        self.assertIsNone(mounts.work_dir)
-        runtime.destroy.assert_called_once_with("sandbox-health")
+        runtime.create.assert_not_called()
+        runtime.destroy.assert_not_called()
         runtime.close.assert_called_once_with()
 
     def test_classifies_qinyuan_bat_request_headers(self) -> None:

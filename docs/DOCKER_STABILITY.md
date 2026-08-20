@@ -53,6 +53,9 @@ $env:QINYUAN_DOCKER_HOST = 'npipe:////./pipe/dockerDesktopLinuxEngine'
 $env:QINYUAN_DOCKER_OPERATION_RETRIES = '3'
 $env:QINYUAN_DOCKER_RETRY_BACKOFF_SECONDS = '0.25'
 $env:QINYUAN_DOCKER_MAX_POOL_SIZE = '8'
+$env:QINYUAN_DOCKER_CONTROL_TIMEOUT_SECONDS = '5'
+$env:QINYUAN_DOCKER_API_TIMEOUT_SECONDS = '315'
+$env:QINYUAN_DOCKER_STOP_TIMEOUT_SECONDS = '2'
 ```
 
 ## 3. Give WSL2 enough headroom
@@ -90,10 +93,22 @@ name is deterministic for that identity. A second startup for the same Agent:
 1. adopts the already-running container;
 2. removes only stopped containers from the same identity;
 3. rejects multiple running containers instead of silently creating another;
-4. retries transient EOF/connection/5xx failures with bounded backoff.
+4. retries transient EOF/connection/5xx failures with bounded backoff for
+   non-destructive Docker operations.
 
 Different Agents still have independent containers and can run concurrently.
 The code does not reduce the configured Agent concurrency.
+
+Timeout cancellation stops a sandbox without deleting it while an exec output
+stream is active. Lifecycle cleanup removes the stopped container afterwards.
+Docker metadata and lifecycle calls use the short control timeout; the long API
+timeout is reserved for command output streams. A stop request is never retried:
+the Docker daemon may still be processing the first request after the client
+times out. An interrupt first closes the active host-side output socket, then
+quarantines the sandbox and sends one stop request. Later tool calls fail
+immediately instead of waiting on the stuck output stream or issuing another
+stop request. Health checks no longer create and immediately delete probe
+containers.
 
 ## 5. Recovery sequence after a Docker failure
 

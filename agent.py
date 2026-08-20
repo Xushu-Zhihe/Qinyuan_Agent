@@ -356,21 +356,13 @@ def _health_check() -> int:
         raise RuntimeError("blackboard protocol readiness: protocol version mismatch")
     from MCPs.Mcp_client import load_registry, select_registry_servers
     from Sandbox.docker_runtime import DockerRuntime
-    from Sandbox.models import SandboxMounts
     from Sandbox.settings import SandboxSettings
 
     settings = SandboxSettings.from_environment()
     runtime = None
-    probe_sandbox_id = None
     try:
         runtime = DockerRuntime(settings)
         runtime._ensure_image_exists()
-        probe_sandbox_id = runtime.create(
-            f"qinyuan-health-{uuid.uuid4().hex}",
-            SandboxMounts(),
-        )
-        runtime.destroy(probe_sandbox_id)
-        probe_sandbox_id = None
         registry = load_registry(
             os.environ.get(
                 "QINYUAN_MCP_REGISTRY",
@@ -398,9 +390,6 @@ def _health_check() -> int:
             select_registry_servers(selected, required_servers)
     finally:
         if runtime is not None:
-            if probe_sandbox_id is not None:
-                with suppress(Exception):
-                    runtime.destroy(probe_sandbox_id)
             runtime.close()
     print("qinyuan-agent health: ok")
     return 0

@@ -20,6 +20,22 @@ project owner releases it explicitly with
 solver project reaches its terminal state. Calls without these lifecycle
 arguments retain the original per-process cleanup behavior.
 
+Sandbox commands have two timeout layers. The command plan's
+`timeout_seconds` is enforced inside the container, while the host stops
+waiting after that limit plus a 10-second grace period. A host timeout or
+provider cancellation marks the sandbox unusable and stops it first. The
+normal lifecycle removes it only after Docker has closed the command output
+stream, avoiding a concurrent `remove(force=True)` against a live runc task.
+`QINYUAN_SANDBOX_EXECUTION_GRACE_SECONDS` changes the host grace period and
+`QINYUAN_SANDBOX_INTERRUPT_TIMEOUT_SECONDS` limits each cleanup wait; both
+must be positive numbers.
+
+Docker control operations use a separate five-second read timeout; only the
+command output stream keeps the longer 315-second timeout. Configure these
+with `QINYUAN_DOCKER_CONTROL_TIMEOUT_SECONDS` and
+`QINYUAN_DOCKER_API_TIMEOUT_SECONDS`. `qinyuan-agent --health` checks Docker,
+the sandbox image, and MCP resources without creating a disposable container.
+
 `-I` 会从当前工作目录之外验证已安装包，避免源码目录碰巧可见而掩盖缺失的运行包或资源。`qinyuan-agent --health` 也会加载 Execution 所需模块，并检查启用的 MCP server 目录。
 
 安装对应沙盒并且验证：

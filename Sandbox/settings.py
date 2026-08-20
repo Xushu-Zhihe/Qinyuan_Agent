@@ -102,8 +102,15 @@ class SandboxSettings:
     # Docker 初始化连接应快速失败，避免 Docker Desktop 异常时等待很久。
     docker_connect_timeout_seconds: int = 10
 
-    # 命令最长可运行 300 秒，因此后续 Docker API 读取超时要更长。
+    # 镜像、网络和容器生命周期操作必须快速失败。长时间运行的命令
+    # 使用独立的流客户端，不得把控制面的超时一并放大。
+    docker_control_timeout_seconds: int = 5
+
+    # 命令最长可运行 300 秒，因此输出流读取超时要更长。
     docker_api_timeout_seconds: int = 315
+
+    # 优雅停止超时后 Docker 会向容器发送 SIGKILL，但仍不会删除容器。
+    docker_stop_timeout_seconds: int = 2
 
     # Keep the Docker API endpoint independent from DOCKER_HOST and proxy
     # variables inherited from a shell running Clash.
@@ -136,6 +143,22 @@ class SandboxSettings:
                 "QINYUAN_DOCKER_HOST",
                 _default_docker_host(),
             ).strip(),
+            docker_connect_timeout_seconds=_configured_positive_int(
+                "QINYUAN_DOCKER_CONNECT_TIMEOUT_SECONDS",
+                10,
+            ),
+            docker_control_timeout_seconds=_configured_positive_int(
+                "QINYUAN_DOCKER_CONTROL_TIMEOUT_SECONDS",
+                5,
+            ),
+            docker_api_timeout_seconds=_configured_positive_int(
+                "QINYUAN_DOCKER_API_TIMEOUT_SECONDS",
+                315,
+            ),
+            docker_stop_timeout_seconds=_configured_positive_int(
+                "QINYUAN_DOCKER_STOP_TIMEOUT_SECONDS",
+                2,
+            ),
             docker_max_pool_size=_configured_positive_int(
                 "QINYUAN_DOCKER_MAX_POOL_SIZE",
                 8,
@@ -187,11 +210,17 @@ class SandboxSettings:
         if self.docker_connect_timeout_seconds < 1:
             raise ValueError("docker_connect_timeout_seconds must be positive")
 
+        if self.docker_control_timeout_seconds < 1:
+            raise ValueError("docker_control_timeout_seconds must be positive")
+
         if self.docker_api_timeout_seconds <= self.maximum_timeout_seconds:
             raise ValueError(
                 "docker_api_timeout_seconds must be greater than "
                 "maximum_timeout_seconds"
             )
+
+        if self.docker_stop_timeout_seconds < 1:
+            raise ValueError("docker_stop_timeout_seconds must be positive")
 
         if self.maximum_output_bytes_per_stream < 1024:
             raise ValueError(

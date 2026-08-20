@@ -26,6 +26,9 @@ class MCPServerNotReadyError(MCPClientError):
 class MCPCommandPlanError(MCPClientError):
     """MCP Server返回了非法的沙盒命令计划"""
 
+class MCPCommandExecutionTimeout(MCPClientError):
+    """沙盒命令超过宿主机强制期限"""
+
 @dataclass(frozen=True, slots=True)
 class MCPServerConfig:
     """单个 MCP Server的启动和权限配置"""
@@ -235,6 +238,8 @@ class MCPManager:
         mcp_call_timeout_seconds: float = 10.0,
         startup_timeout_seconds: float = 30.0,
         shutdown_timeout_seconds: float = 10.0,
+        sandbox_execution_grace_seconds: float = 10.0,
+        sandbox_interrupt_timeout_seconds: float = 10.0,
         output_character_limit: int = 20_000,
         audit_path: str | Path | None = None,
         required_servers: Iterable[str] | None = None,
@@ -245,6 +250,10 @@ class MCPManager:
             raise ValueError("startup_timeout_seconds must be positive")
         if shutdown_timeout_seconds <= 0:
             raise ValueError("shutdown_timeout_seconds must be positive")
+        if sandbox_execution_grace_seconds <= 0:
+            raise ValueError("sandbox_execution_grace_seconds must be positive")
+        if sandbox_interrupt_timeout_seconds <= 0:
+            raise ValueError("sandbox_interrupt_timeout_seconds must be positive")
 
         if output_character_limit < 1_000:
             raise ValueError("output_character_limit must be at least 1000")
@@ -254,6 +263,8 @@ class MCPManager:
         self.mcp_call_timeout_seconds = mcp_call_timeout_seconds
         self.startup_timeout_seconds = startup_timeout_seconds
         self.shutdown_timeout_seconds = shutdown_timeout_seconds
+        self.sandbox_execution_grace_seconds = sandbox_execution_grace_seconds
+        self.sandbox_interrupt_timeout_seconds = sandbox_interrupt_timeout_seconds
         self.output_character_limit = output_character_limit
         self.audit_path = Path(audit_path).resolve() if audit_path is not None else None
 
@@ -588,12 +599,57 @@ class MCPManager:
             "timeout_seconds": request.timeout_seconds,
         }
         await self._write_audit({"event": "started", **audit_base})
-        try:
-            result = await asyncio.to_thread(
+        execution_task = asyncio.create_task(
+            asyncio.to_thread(
                 self.sandbox_service.execute,
                 agent_id,
                 request,
             )
+        )
+        host_timeout = request.timeout_seconds + self.sandbox_execution_grace_seconds
+        try:
+            result = await asyncio.wait_for(
+                asyncio.shield(execution_task),
+                timeout=host_timeout,
+            )
+        except asyncio.TimeoutError as exc:
+            interrupt_error = await self._interrupt_sandbox_execution(
+                agent_id,
+                execution_task,
+            )
+            message = (
+                "sandbox command exceeded host timeout of "
+                f"{host_timeout:g}s and was interrupted"
+            )
+            if interrupt_error is not None:
+                message += f"; sandbox interrupt failed: {interrupt_error}"
+            await self._write_audit(
+                {
+                    "event": "failed",
+                    **audit_base,
+                    "error": "SandboxCommandTimeout",
+                    "message": message,
+                }
+            )
+            raise MCPCommandExecutionTimeout(message) from exc
+        except asyncio.CancelledError:
+            interrupt_error = await asyncio.shield(
+                self._interrupt_sandbox_execution(agent_id, execution_task)
+            )
+            message = "sandbox command was cancelled and interrupted"
+            if interrupt_error is not None:
+                message += f"; sandbox interrupt failed: {interrupt_error}"
+            await asyncio.shield(
+                self._write_audit(
+                    {
+                        "event": "failed",
+                        **audit_base,
+                        "error": "CancelledError",
+                        "message": message,
+                    }
+                )
+            )
+            raise
         except Exception as exc:
             await self._write_audit(
                 {
@@ -658,6 +714,39 @@ class MCPManager:
             }
         )
         return execution_result
+
+    async def _interrupt_sandbox_execution(
+        self,
+        agent_id: str,
+        execution_task: asyncio.Task[Any],
+    ) -> str | None:
+        interrupt_error: str | None = None
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.sandbox_service.interrupt_for_agent,
+                    agent_id,
+                ),
+                timeout=self.sandbox_interrupt_timeout_seconds,
+            )
+        except Exception as exc:
+            interrupt_error = f"{type(exc).__name__}: {exc}"
+
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(execution_task),
+                timeout=self.sandbox_interrupt_timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            # The container was stopped but is deliberately not removed while
+            # Docker may still own the exec stream. Do not extend the provider
+            # timeout while waiting for a broken client-side stream to close.
+            execution_task.cancel()
+        except Exception:
+            # Stopping the container normally makes the blocked execution fail;
+            # awaiting it here retrieves that expected exception.
+            pass
+        return interrupt_error
 
     def _execute_bound_tool_sync(
         self,
@@ -873,6 +962,12 @@ async def build_mcp_runtime(
         ),
         shutdown_timeout_seconds=float(
             os.environ.get("QINYUAN_MCP_SHUTDOWN_TIMEOUT_SECONDS", "10")
+        ),
+        sandbox_execution_grace_seconds=float(
+            os.environ.get("QINYUAN_SANDBOX_EXECUTION_GRACE_SECONDS", "10")
+        ),
+        sandbox_interrupt_timeout_seconds=float(
+            os.environ.get("QINYUAN_SANDBOX_INTERRUPT_TIMEOUT_SECONDS", "10")
         ),
         output_character_limit=int(
             os.environ.get("QINYUAN_MCP_OUTPUT_CHARACTER_LIMIT", "20000")

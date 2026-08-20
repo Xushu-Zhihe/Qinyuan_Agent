@@ -4,6 +4,7 @@ import shutil
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
+from threading import Event, Lock, Thread
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
@@ -11,7 +12,12 @@ import requests
 
 from MCPs.Mcp_client import load_registry, select_registry_servers
 from Sandbox.docker_runtime import DockerRuntime, DockerRuntimeError
-from Sandbox.models import SandboxMounts
+from Sandbox.models import (
+    CommandRequest,
+    CommandResult,
+    SandboxMounts,
+    SandboxStatus,
+)
 from Sandbox.service import SandboxError, SandboxService
 from Sandbox.settings import SandboxSettings
 
@@ -40,6 +46,7 @@ def _directories():
 class _FakeRuntime:
     def __init__(self) -> None:
         self.created = None
+        self.interrupted = []
         self.destroyed = []
         self.closed = False
 
@@ -50,8 +57,64 @@ class _FakeRuntime:
     def destroy(self, sandbox_id):
         self.destroyed.append(sandbox_id)
 
+    def interrupt(self, sandbox_id):
+        self.interrupted.append(sandbox_id)
+
     def close(self):
         self.closed = True
+
+
+class _BlockingRuntime(_FakeRuntime):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = Event()
+        self.released = Event()
+
+    def execute(self, sandbox_id, request):
+        del request
+        self.started.set()
+        self.released.wait()
+        return CommandResult(
+            sandbox_id=sandbox_id,
+            exit_code=137,
+            stdout="",
+            stderr="interrupted",
+        )
+
+    def interrupt(self, sandbox_id):
+        super().interrupt(sandbox_id)
+        self.released.set()
+
+
+class _StuckInterruptRuntime(_BlockingRuntime):
+    def __init__(self) -> None:
+        super().__init__()
+        self.interrupt_started = Event()
+        self.interrupt_released = Event()
+
+    def interrupt(self, sandbox_id):
+        _FakeRuntime.interrupt(self, sandbox_id)
+        self.interrupt_started.set()
+        self.interrupt_released.wait()
+
+
+class _BlockingOutputStream:
+    def __init__(self) -> None:
+        self.started = Event()
+        self.closed = Event()
+        self.close_calls = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self.started.set()
+        self.closed.wait()
+        raise StopIteration
+
+    def close(self) -> None:
+        self.close_calls += 1
+        self.closed.set()
 
 
 class _FakeContainer:
@@ -78,6 +141,77 @@ class _FakeContainers:
 
 
 class SandboxConfigurationTests(unittest.TestCase):
+    def test_interrupt_stops_then_cleanup_destroys_after_execution_unlocks(
+        self,
+    ) -> None:
+        runtime = _BlockingRuntime()
+        service = SandboxService(runtime)
+        service.start_for_agent("agent-1")
+        execution = Thread(
+            target=service.execute,
+            args=("agent-1", CommandRequest("bash", timeout_seconds=30)),
+        )
+        execution.start()
+        self.assertTrue(runtime.started.wait(1))
+
+        self.assertEqual(service.interrupt_for_agent("agent-1"), "sandbox-1")
+        execution.join(1)
+
+        self.assertFalse(execution.is_alive())
+        self.assertEqual(runtime.interrupted, ["sandbox-1"])
+        self.assertEqual(runtime.destroyed, [])
+        self.assertEqual(
+            service.get_session("agent-1").status,
+            SandboxStatus.STOPPED,
+        )
+
+        service.close()
+        self.assertEqual(runtime.destroyed, ["sandbox-1"])
+
+    def test_interrupted_sandbox_rejects_new_execution_before_agent_lock(
+        self,
+    ) -> None:
+        runtime = _StuckInterruptRuntime()
+        service = SandboxService(runtime)
+        service.start_for_agent("agent-1")
+        execution = Thread(
+            target=service.execute,
+            args=("agent-1", CommandRequest("bash", timeout_seconds=30)),
+        )
+        execution.start()
+        self.assertTrue(runtime.started.wait(1))
+        interruption = Thread(
+            target=service.interrupt_for_agent,
+            args=("agent-1",),
+        )
+        interruption.start()
+        self.assertTrue(runtime.interrupt_started.wait(1))
+
+        try:
+            with self.assertRaisesRegex(SandboxError, "is not running"):
+                service.execute(
+                    "agent-1",
+                    CommandRequest("bash", timeout_seconds=30),
+                )
+        finally:
+            runtime.interrupt_released.set()
+            runtime.released.set()
+            interruption.join(1)
+            execution.join(1)
+
+        self.assertFalse(interruption.is_alive())
+        self.assertFalse(execution.is_alive())
+
+    def test_repeated_interrupt_only_stops_docker_once(self) -> None:
+        runtime = _FakeRuntime()
+        service = SandboxService(runtime)
+        service.start_for_agent("agent-1")
+
+        self.assertEqual(service.interrupt_for_agent("agent-1"), "sandbox-1")
+        self.assertEqual(service.interrupt_for_agent("agent-1"), "sandbox-1")
+
+        self.assertEqual(runtime.interrupted, ["sandbox-1"])
+
     def test_docker_connection_error_preserves_underlying_cause(self) -> None:
         with patch(
             "Sandbox.docker_runtime.docker.DockerClient",
@@ -108,6 +242,7 @@ class SandboxConfigurationTests(unittest.TestCase):
             max_pool_size=8,
         )
         self.assertFalse(client.api.trust_env)
+        self.assertEqual(client.api.timeout, 5)
 
     def test_transient_docker_transport_failure_is_retried(self) -> None:
         runtime = object.__new__(DockerRuntime)
@@ -123,6 +258,30 @@ class SandboxConfigurationTests(unittest.TestCase):
             "ok",
         )
         self.assertEqual(operation.call_count, 2)
+
+    def test_long_exec_stream_uses_a_separate_docker_client(self) -> None:
+        runtime = object.__new__(DockerRuntime)
+        runtime.settings = SandboxSettings()
+        runtime.client = MagicMock()
+        runtime.client.api.api_version = "1.55"
+        runtime._stream_client = None
+        runtime._stream_client_lock = Lock()
+        stream_client = MagicMock()
+
+        with patch(
+            "Sandbox.docker_runtime.docker.DockerClient",
+            return_value=stream_client,
+        ) as docker_client:
+            api = runtime._stream_api()
+
+        self.assertIs(api, stream_client.api)
+        docker_client.assert_called_once_with(
+            base_url="npipe:////./pipe/dockerDesktopLinuxEngine",
+            version="1.55",
+            timeout=315,
+            max_pool_size=8,
+        )
+        self.assertFalse(stream_client.api.trust_env)
 
     def test_mounts_resolve_sibling_directories(self) -> None:
         with _directories() as (_, challenge, work):
@@ -252,7 +411,7 @@ class SandboxConfigurationTests(unittest.TestCase):
 
         runtime.client.containers.create.assert_called_once()
         self.assertEqual(container.start.call_count, 3)
-        container.remove.assert_called_once_with(force=True)
+        container.remove.assert_called_once_with(force=False)
 
     def test_docker_create_reuses_running_agent_container(self) -> None:
         with _directories() as (_, challenge, work):
@@ -298,6 +457,10 @@ class SandboxConfigurationTests(unittest.TestCase):
     def test_settings_pin_docker_endpoint_and_retry_policy(self) -> None:
         environment = {
             "QINYUAN_DOCKER_HOST": "npipe:////./pipe/dockerDesktopLinuxEngine",
+            "QINYUAN_DOCKER_CONNECT_TIMEOUT_SECONDS": "7",
+            "QINYUAN_DOCKER_CONTROL_TIMEOUT_SECONDS": "4",
+            "QINYUAN_DOCKER_API_TIMEOUT_SECONDS": "320",
+            "QINYUAN_DOCKER_STOP_TIMEOUT_SECONDS": "3",
             "QINYUAN_DOCKER_MAX_POOL_SIZE": "4",
             "QINYUAN_DOCKER_OPERATION_RETRIES": "5",
             "QINYUAN_DOCKER_RETRY_BACKOFF_SECONDS": "0.1",
@@ -308,6 +471,10 @@ class SandboxConfigurationTests(unittest.TestCase):
             settings.docker_host,
             "npipe:////./pipe/dockerDesktopLinuxEngine",
         )
+        self.assertEqual(settings.docker_connect_timeout_seconds, 7)
+        self.assertEqual(settings.docker_control_timeout_seconds, 4)
+        self.assertEqual(settings.docker_api_timeout_seconds, 320)
+        self.assertEqual(settings.docker_stop_timeout_seconds, 3)
         self.assertEqual(settings.docker_max_pool_size, 4)
         self.assertEqual(settings.docker_operation_retries, 5)
         self.assertEqual(settings.docker_retry_backoff_seconds, 0.1)
@@ -343,7 +510,7 @@ class SandboxConfigurationTests(unittest.TestCase):
                 ]
             },
         )
-        stale.remove.assert_called_once_with(force=True)
+        stale.remove.assert_called_once_with(force=False)
 
     def test_explicit_owner_release_removes_running_sandbox(self) -> None:
         runtime = object.__new__(DockerRuntime)
@@ -352,12 +519,89 @@ class SandboxConfigurationTests(unittest.TestCase):
         running = MagicMock()
         running.id = "running-1"
         running.status = "running"
+        running.stop.side_effect = lambda **_kwargs: setattr(running, "status", "exited")
         runtime.client.containers.list.return_value = [running]
 
         removed = runtime.destroy_agent_containers("agent-1")
 
         self.assertEqual(removed, ("running-1",))
-        running.remove.assert_called_once_with(force=True)
+        running.stop.assert_called_once_with(timeout=2)
+        running.remove.assert_called_once_with(force=False)
+
+    def test_interrupt_stops_running_container_without_removing_it(self) -> None:
+        runtime = object.__new__(DockerRuntime)
+        runtime.settings = SandboxSettings()
+        runtime.client = MagicMock()
+        runtime._active_output_streams = {}
+        runtime._active_output_streams_lock = Lock()
+        running = MagicMock()
+        running.id = "running-1"
+        running.status = "running"
+        running.stop.side_effect = lambda **_kwargs: setattr(running, "status", "exited")
+        runtime.client.containers.get.return_value = running
+
+        runtime.interrupt("running-1")
+
+        running.stop.assert_called_once_with(timeout=2)
+        running.remove.assert_not_called()
+
+    def test_interrupt_closes_host_output_stream_and_unblocks_reader(self) -> None:
+        runtime = object.__new__(DockerRuntime)
+        runtime.settings = SandboxSettings()
+        runtime.client = MagicMock()
+        runtime._active_output_streams = {}
+        runtime._active_output_streams_lock = Lock()
+        output_stream = _BlockingOutputStream()
+        stream_api = MagicMock()
+        stream_api.exec_start.return_value = output_stream
+        runtime._stream_api = MagicMock(return_value=stream_api)
+        running = MagicMock()
+        running.id = "running-1"
+        running.status = "running"
+        running.attrs = {"Config": {"WorkingDir": "/work"}}
+        running.stop.side_effect = lambda **_kwargs: setattr(running, "status", "exited")
+        runtime._get_running_container = MagicMock(return_value=running)
+        runtime.client.containers.get.return_value = running
+        runtime.client.api.exec_create.return_value = {"Id": "exec-1"}
+        runtime.client.api.exec_inspect.return_value = {"ExitCode": 137}
+        results = []
+        execution = Thread(
+            target=lambda: results.append(
+                runtime.execute(
+                    "running-1",
+                    CommandRequest("bash", timeout_seconds=30),
+                )
+            )
+        )
+        execution.start()
+        self.assertTrue(output_stream.started.wait(1))
+
+        runtime.interrupt("running-1")
+        execution.join(1)
+
+        self.assertFalse(execution.is_alive())
+        self.assertEqual(output_stream.close_calls, 1)
+        self.assertEqual(results[0].exit_code, 137)
+        running.stop.assert_called_once_with(timeout=2)
+
+    def test_destroy_does_not_retry_or_remove_when_stop_times_out(self) -> None:
+        runtime = object.__new__(DockerRuntime)
+        runtime.settings = SandboxSettings(
+            docker_operation_retries=3,
+            docker_retry_backoff_seconds=0,
+        )
+        runtime.client = MagicMock()
+        running = MagicMock()
+        running.id = "running-1"
+        running.status = "running"
+        running.stop.side_effect = requests.exceptions.ReadTimeout("Docker stuck")
+        runtime.client.containers.get.return_value = running
+
+        with self.assertRaisesRegex(DockerRuntimeError, "stop sandbox"):
+            runtime.destroy("running-1")
+
+        running.stop.assert_called_once_with(timeout=2)
+        running.remove.assert_not_called()
 
     def test_mcp_server_allowlist_only_restricts_enabled_registry(self) -> None:
         registry = load_registry(REGISTRY)

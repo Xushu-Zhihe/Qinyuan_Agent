@@ -6,12 +6,14 @@ import sys
 import unittest
 import json
 import shutil
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
 from MCPs.Mcp_client.client import (
     MCPClientError,
+    MCPCommandExecutionTimeout,
     MCPManager,
     MCPRegistryConfig,
     MCPServerConfig,
@@ -134,12 +136,15 @@ class _SlowSession:
 
 
 class _SuccessfulSession:
+    def __init__(self, timeout_seconds: int = 10) -> None:
+        self.timeout_seconds = timeout_seconds
+
     async def call_tool(self, *_args, **_kwargs):
         plan = {
             "sandbox_command": {
                 "tool": "bash",
                 "arguments": ["--noprofile", "--norc", "-lc", "printf ok"],
-                "timeout_seconds": 10,
+                "timeout_seconds": self.timeout_seconds,
             }
         }
         return SimpleNamespace(
@@ -160,7 +165,44 @@ class _SuccessfulSandbox:
         )
 
 
+class _BlockingSandbox:
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.released = threading.Event()
+        self.interrupted: list[str] = []
+
+    def execute(self, _agent_id, _request):
+        self.started.set()
+        self.released.wait()
+        raise RuntimeError("sandbox interrupted")
+
+    def interrupt_for_agent(self, agent_id):
+        self.interrupted.append(agent_id)
+        self.released.set()
+        return "sandbox-1"
+
+
 class McpManagerTimeoutTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _register_shell(manager: MCPManager, session: object) -> None:
+        config = MCPServerConfig(
+            name="shell",
+            sandbox_tools=frozenset({"bash"}),
+        )
+        manager.runtimes["shell"] = MCPServerRuntime(
+            config=config,
+            session=session,
+            status="ready",
+        )
+        manager.tool_index["shell.run_bash"] = MCPToolMeta(
+            server_name="shell",
+            tool_name="run_bash",
+            qualified_name="shell.run_bash",
+            description="",
+            input_schema={},
+            tags=frozenset(),
+        )
+
     async def test_command_plan_timeout_stops_before_sandbox_execution(self) -> None:
         config = MCPServerConfig(
             name="slow",
@@ -244,6 +286,76 @@ class McpManagerTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 root.parent.rmdir()
             except OSError:
                 pass
+
+    async def test_host_timeout_interrupts_blocked_sandbox_execution(self) -> None:
+        root = ROOT / ".test-work" / uuid4().hex
+        root.mkdir(parents=True)
+        audit_path = root / "mcp-audit.jsonl"
+        sandbox = _BlockingSandbox()
+        config = MCPServerConfig(
+            name="shell",
+            sandbox_tools=frozenset({"bash"}),
+        )
+        manager = MCPManager(
+            MCPRegistryConfig({"shell": config}),
+            sandbox,
+            sandbox_execution_grace_seconds=0.01,
+            sandbox_interrupt_timeout_seconds=0.5,
+            audit_path=audit_path,
+        )
+        self._register_shell(manager, _SuccessfulSession(timeout_seconds=1))
+        try:
+            with self.assertRaisesRegex(
+                MCPCommandExecutionTimeout,
+                "exceeded host timeout",
+            ):
+                await manager._execute_bound_tool(
+                    agent_id="agent-1",
+                    qualified_name="shell.run_bash",
+                    arguments={"script": "sleep forever"},
+                )
+
+            records = [
+                json.loads(line)
+                for line in audit_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(sandbox.interrupted, ["agent-1"])
+            self.assertEqual([record["event"] for record in records], [
+                "started",
+                "failed",
+            ])
+            self.assertEqual(records[1]["error"], "SandboxCommandTimeout")
+        finally:
+            sandbox.released.set()
+            shutil.rmtree(root, ignore_errors=True)
+
+    async def test_cancellation_interrupts_blocked_sandbox_execution(self) -> None:
+        sandbox = _BlockingSandbox()
+        config = MCPServerConfig(
+            name="shell",
+            sandbox_tools=frozenset({"bash"}),
+        )
+        manager = MCPManager(
+            MCPRegistryConfig({"shell": config}),
+            sandbox,
+            sandbox_execution_grace_seconds=1,
+            sandbox_interrupt_timeout_seconds=0.5,
+        )
+        self._register_shell(manager, _SuccessfulSession(timeout_seconds=30))
+        task = asyncio.create_task(
+            manager._execute_bound_tool(
+                agent_id="agent-1",
+                qualified_name="shell.run_bash",
+                arguments={"script": "sleep forever"},
+            )
+        )
+        self.assertTrue(await asyncio.to_thread(sandbox.started.wait, 1))
+        task.cancel()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertEqual(sandbox.interrupted, ["agent-1"])
 
 
 if __name__ == "__main__":

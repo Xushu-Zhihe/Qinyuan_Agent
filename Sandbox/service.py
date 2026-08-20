@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from threading import RLock
 
@@ -140,6 +141,14 @@ class SandboxService:
                 f"Agent {agent_id!r} does not have a sandbox"
             )
 
+        # An interrupted command may still own agent_lock while Docker drains
+        # its output stream. Reject the quarantined sandbox before waiting for
+        # that lock so later tool calls cannot trigger another host timeout.
+        if session.status != SandboxStatus.RUNNING:
+            raise SandboxError(
+                f"Sandbox {session.sandbox_id!r} is not running"
+            )
+
         with agent_lock:
             with self._registry_lock:
                 current_session = self._sessions.get(agent_id)
@@ -154,8 +163,7 @@ class SandboxService:
 
             if current_session.status != SandboxStatus.RUNNING:
                 raise SandboxError(
-                    f"Sandbox {current_session.sandbox_id!r}"
-                    "is not running"
+                    f"Sandbox {current_session.sandbox_id!r} is not running"
                 )
             
             return self.runtime.execute(
@@ -194,6 +202,34 @@ class SandboxService:
                     and current.sandbox_id == session.sandbox_id
                 ):
                     self._sessions.pop(normalized_agent_id, None)
+
+    def interrupt_for_agent(self, agent_id: str) -> str | None:
+        """Abort an in-flight command without deleting its active output stream.
+
+        This deliberately does not acquire the per-Agent lock: execute() holds
+        that lock for the lifetime of a Docker output stream, so waiting for it
+        would make cancellation depend on the operation being cancelled.
+        """
+
+        normalized_agent_id = agent_id.strip()
+        if not normalized_agent_id:
+            return None
+
+        with self._registry_lock:
+            current = self._sessions.get(normalized_agent_id)
+            if current is None:
+                return None
+            if current.status != SandboxStatus.RUNNING:
+                return current.sandbox_id
+            self._sessions[normalized_agent_id] = replace(
+                current,
+                status=SandboxStatus.STOPPED,
+            )
+
+        # Stop first so Docker can close the exec stream. Deletion is performed
+        # later by the normal lifecycle path after execute() releases its lock.
+        self.runtime.interrupt(current.sandbox_id)
+        return current.sandbox_id
 
     def get_session(self,agent_id: str) -> SandboxSession | None :
         with self._registry_lock:
