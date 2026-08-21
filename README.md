@@ -12,6 +12,14 @@ python -I -c "from tools import create_agent_tool_registry; from MCPs.Mcp_client
 qinyuan-agent --required-skill blackboard-result-protocol --result-protocol-version 2 --challenge-dir .\challenge --work-dir .\work
 ```
 
+When `--challenge-dir` is present, the first sandbox execution must use
+`shell_run_bash` by itself to list `/challenge` and run `file` on every supplied
+file before any other analysis or network action.
+
+Android inputs can be decompiled with the registered `jadx.decompile_android`
+MCP tool. It runs the pinned JADX CLI inside the sandbox and writes output only
+to a `/work` subdirectory.
+
 For project-owned sandboxes, qinyuan-bat also supplies
 `--sandbox-owner-id <stable-owner>` and `--sandbox-work-dir <stable-workspace>`.
 Those short-lived provider processes detach without deleting the sandbox. The
@@ -46,7 +54,7 @@ docker build `
   --provenance=false `
   --sbom=false `
   --file Sandbox/dockerfile `
-  --tag qinyuan/pentest-sandbox:0.3.2 `
+  --tag qinyuan/pentest-sandbox:0.3.3 `
   .
 qinyuan-agent --health
 ```

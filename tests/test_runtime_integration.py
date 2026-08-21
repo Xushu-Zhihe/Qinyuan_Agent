@@ -309,7 +309,7 @@ class DockerRuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_image_contains_all_registered_runtime_tools(self) -> None:
         settings = SandboxSettings(
-            allowed_tools=frozenset({"python3", "pwsh"})
+            allowed_tools=frozenset({"python3", "pwsh", "jadx"})
         )
         service = SandboxService(
             await asyncio.to_thread(DockerRuntime, settings),
@@ -326,7 +326,7 @@ class DockerRuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
                         "-c",
                         "import shutil,sys; "
                         "tools=['bash','nmap','curl','subfinder','amass','httpx',"
-                        "'ffuf','dirsearch','nuclei','pwsh']; "
+                        "'ffuf','dirsearch','nuclei','pwsh','jadx']; "
                         "missing=[tool for tool in tools if not shutil.which(tool)]; "
                         "print(','.join(missing)); sys.exit(bool(missing))",
                     ),
@@ -354,6 +354,13 @@ class DockerRuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 powershell.stdout + powershell.stderr,
             )
             self.assertTrue(powershell.stdout.strip().startswith("7.5."))
+            jadx = await asyncio.to_thread(
+                service.execute,
+                "integration-tools",
+                CommandRequest(tool="jadx", arguments=("--version",)),
+            )
+            self.assertEqual(jadx.exit_code, 0, jadx.stdout + jadx.stderr)
+            self.assertIn("1.5.6", jadx.stdout + jadx.stderr)
         finally:
             await asyncio.to_thread(service.close)
 

@@ -104,6 +104,15 @@
       "sandboxTools": ["file"],
       "enabled": true
     },
+    "jadx": {
+      "transport": "stdio",
+      "command": "{python}",
+      "cwd": "../Jadx_Mcp",
+      "args": ["server.py"],
+      "tags": ["android", "reverse-engineering", "decompilation"],
+      "sandboxTools": ["jadx"],
+      "enabled": true
+    },
     "binutils": {
       "transport": "stdio",
       "command": "{python}",

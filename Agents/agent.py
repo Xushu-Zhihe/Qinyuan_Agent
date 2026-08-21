@@ -41,6 +41,8 @@ class ToolCallingAgentRunner:
         max_steps: int = 10,
         require_tool_call_before_final: bool = False,
         require_blackboard_progress_before_final: bool = False,
+        required_initial_tool: str | None = None,
+        required_initial_tool_args: dict[str, Any] | None = None,
         llm_timeout_seconds: float | None = None,
         max_tool_result_chars: int = 12_000,
     ) -> None:
@@ -61,6 +63,12 @@ class ToolCallingAgentRunner:
         self.require_blackboard_progress_before_final = (
             require_blackboard_progress_before_final
         )
+        self.required_initial_tool = required_initial_tool
+        self.required_initial_tool_args = (
+            dict(required_initial_tool_args)
+            if required_initial_tool_args is not None
+            else None
+        )
         self.llm_timeout_seconds = llm_timeout_seconds
         self.max_tool_result_chars = max_tool_result_chars
 
@@ -69,6 +77,21 @@ class ToolCallingAgentRunner:
             tool.name: tool
             for tool in self.tools
         }
+        if (
+            self.required_initial_tool is not None
+            and self.required_initial_tool not in self.tools_map
+        ):
+            raise KeyError(
+                "Required initial tool is not registered: "
+                f"{self.required_initial_tool!r}"
+            )
+        if (
+            self.required_initial_tool_args is not None
+            and self.required_initial_tool is None
+        ):
+            raise ValueError(
+                "required_initial_tool_args requires required_initial_tool"
+            )
 
         self.llm = (
             llm.bind_tools(self.tools)
@@ -117,8 +140,16 @@ class ToolCallingAgentRunner:
             HumanMessage(content=input_data.strip()),
         ]
 
-    @staticmethod
-    def _tool_required_message() -> HumanMessage:
+    def _tool_required_message(self) -> HumanMessage:
+        if self.required_initial_tool is not None:
+            return HumanMessage(
+                content=(
+                    "Before any other execution, call the required tool "
+                    f"`{self.required_initial_tool}` by itself. It must "
+                    "successfully enumerate /challenge and identify every "
+                    "file type. Do not batch other tool calls with it."
+                )
+            )
         return HumanMessage(
             content=(
                 "The previous response did not call any available tool. "
@@ -129,6 +160,25 @@ class ToolCallingAgentRunner:
                 "current Assigned Intent, is actually verified."
             )
         )
+
+    def _initial_tool_rejection(self, tool_name: str) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "status": "rejected",
+            "message": (
+                f"Tool {tool_name!r} was not executed. The first successful "
+                "execution must be the required challenge inventory tool "
+                f"{self.required_initial_tool!r}, called by itself."
+            ),
+        }
+
+    @staticmethod
+    def _tool_succeeded(result: Any) -> bool:
+        if not isinstance(result, dict):
+            return False
+        if "ok" in result:
+            return result.get("ok") is True
+        return result.get("status") == "completed"
 
     def _serialize_tool_result(self, value: Any) -> str:
         content = self._serialize_content(value)
@@ -199,6 +249,7 @@ class ToolCallingAgentRunner:
 
         messages = self._initial_messages(input_data)
         tool_required = self.require_tool_call_before_final
+        initial_tool_pending = self.required_initial_tool is not None
 
         for _ in range(self.max_steps):
             response = self.llm.invoke(messages)
@@ -207,7 +258,7 @@ class ToolCallingAgentRunner:
             tool_calls = getattr(response, "tool_calls", None) or []
 
             if not tool_calls:
-                if tool_required:
+                if initial_tool_pending or tool_required:
                     messages.append(self._tool_required_message())
                     continue
                 final_content = self._final_content(response)
@@ -218,14 +269,22 @@ class ToolCallingAgentRunner:
                 return final_content
 
             registered_tool_called = False
-            for tool_call in tool_calls:
+            initial_batch = initial_tool_pending
+            first_tool_name = str(tool_calls[0].get("name", ""))
+            initial_tool_allowed = (
+                not initial_batch
+                or first_tool_name == self.required_initial_tool
+            )
+            for index, tool_call in enumerate(tool_calls):
                 tool_name = tool_call.get("name", "")
                 tool_args = tool_call.get("args", {})
                 tool_call_id = tool_call.get("id", "")
 
                 tool = self.tools_map.get(tool_name)
 
-                if tool is None:
+                if initial_batch and (not initial_tool_allowed or index > 0):
+                    result = self._initial_tool_rejection(str(tool_name))
+                elif tool is None:
                     result: Any = {
                         "ok": False,
                         "status": "failed",
@@ -233,6 +292,12 @@ class ToolCallingAgentRunner:
                     }
                 else:
                     registered_tool_called = True
+                    if (
+                        initial_batch
+                        and index == 0
+                        and self.required_initial_tool_args is not None
+                    ):
+                        tool_args = self.required_initial_tool_args
                     try:
                         result = tool.invoke(tool_args)
                     except Exception as error:
@@ -244,6 +309,14 @@ class ToolCallingAgentRunner:
                             "message": str(error),
                         }
 
+                if (
+                    initial_batch
+                    and index == 0
+                    and tool_name == self.required_initial_tool
+                    and self._tool_succeeded(result)
+                ):
+                    initial_tool_pending = False
+
                 messages.append(
                     ToolMessage(
                         content=self._serialize_tool_result(result),
@@ -253,6 +326,18 @@ class ToolCallingAgentRunner:
 
             if registered_tool_called:
                 tool_required = False
+            if initial_batch and initial_tool_pending:
+                messages.append(self._tool_required_message())
+            elif initial_batch and len(tool_calls) > 1:
+                messages.append(
+                    HumanMessage(
+                        content=(
+                            "The challenge inventory completed. Other calls "
+                            "from the same batch were not executed. Review the "
+                            "inventory output before choosing the next tool."
+                        )
+                    )
+                )
 
         raise RuntimeError(
             f"Agent exceeded maximum step count: {self.max_steps}"
@@ -268,6 +353,7 @@ class ToolCallingAgentRunner:
 
         messages = self._initial_messages(input_data)
         tool_required = self.require_tool_call_before_final
+        initial_tool_pending = self.required_initial_tool is not None
 
         for _ in range(self.max_steps):
             try:
@@ -285,7 +371,7 @@ class ToolCallingAgentRunner:
             tool_calls = getattr(response, "tool_calls", None) or []
 
             if not tool_calls:
-                if tool_required:
+                if initial_tool_pending or tool_required:
                     messages.append(self._tool_required_message())
                     continue
                 final_content = self._final_content(response)
@@ -296,14 +382,22 @@ class ToolCallingAgentRunner:
                 return final_content
 
             registered_tool_called = False
-            for tool_call in tool_calls:
+            initial_batch = initial_tool_pending
+            first_tool_name = str(tool_calls[0].get("name", ""))
+            initial_tool_allowed = (
+                not initial_batch
+                or first_tool_name == self.required_initial_tool
+            )
+            for index, tool_call in enumerate(tool_calls):
                 tool_name = tool_call.get("name", "")
                 tool_args = tool_call.get("args", {})
                 tool_call_id = tool_call.get("id", "")
 
                 tool = self.tools_map.get(tool_name)
 
-                if tool is None:
+                if initial_batch and (not initial_tool_allowed or index > 0):
+                    result = self._initial_tool_rejection(str(tool_name))
+                elif tool is None:
                     result: Any = {
                         "ok": False,
                         "status": "failed",
@@ -311,6 +405,12 @@ class ToolCallingAgentRunner:
                     }
                 else:
                     registered_tool_called = True
+                    if (
+                        initial_batch
+                        and index == 0
+                        and self.required_initial_tool_args is not None
+                    ):
+                        tool_args = self.required_initial_tool_args
                     try:
                         result = await tool.ainvoke(tool_args)
                     except Exception as error:
@@ -321,6 +421,14 @@ class ToolCallingAgentRunner:
                             "message": str(error),
                         }
 
+                if (
+                    initial_batch
+                    and index == 0
+                    and tool_name == self.required_initial_tool
+                    and self._tool_succeeded(result)
+                ):
+                    initial_tool_pending = False
+
                 messages.append(
                     ToolMessage(
                         content=self._serialize_tool_result(result),
@@ -330,6 +438,18 @@ class ToolCallingAgentRunner:
 
             if registered_tool_called:
                 tool_required = False
+            if initial_batch and initial_tool_pending:
+                messages.append(self._tool_required_message())
+            elif initial_batch and len(tool_calls) > 1:
+                messages.append(
+                    HumanMessage(
+                        content=(
+                            "The challenge inventory completed. Other calls "
+                            "from the same batch were not executed. Review the "
+                            "inventory output before choosing the next tool."
+                        )
+                    )
+                )
 
         raise RuntimeError(
             f"Agent exceeded maximum step count: {self.max_steps}"
@@ -378,6 +498,8 @@ class SkillAgentFactory:
         max_steps: int = 10,
         require_tool_call_before_final: bool = False,
         require_blackboard_progress_before_final: bool = False,
+        required_initial_tool: str | None = None,
+        required_initial_tool_args: dict[str, Any] | None = None,
     ) -> ToolCallingAgentRunner:
         """
         直接根据系统提示词创建 Agent。
@@ -409,6 +531,8 @@ class SkillAgentFactory:
             require_blackboard_progress_before_final=(
                 require_blackboard_progress_before_final
             ),
+            required_initial_tool=required_initial_tool,
+            required_initial_tool_args=required_initial_tool_args,
         )
 
     def create_from_prompt_with_skills(
@@ -420,6 +544,8 @@ class SkillAgentFactory:
         max_steps: int = 10,
         require_tool_call_before_final: bool = False,
         require_blackboard_progress_before_final: bool = False,
+        required_initial_tool: str | None = None,
+        required_initial_tool_args: dict[str, Any] | None = None,
     ) -> ToolCallingAgentRunner:
         """Create an agent with deterministic, authoritative Skill text."""
         skill_texts = [self.load_skill_md(name).strip() for name in required_skills]
@@ -430,6 +556,8 @@ class SkillAgentFactory:
             max_steps=max_steps,
             require_tool_call_before_final=require_tool_call_before_final,
             require_blackboard_progress_before_final=require_blackboard_progress_before_final,
+            required_initial_tool=required_initial_tool,
+            required_initial_tool_args=required_initial_tool_args,
         )
     
     def create(
@@ -439,6 +567,8 @@ class SkillAgentFactory:
         max_steps: int = 10,
         require_tool_call_before_final: bool = False,
         require_blackboard_progress_before_final: bool = False,
+        required_initial_tool: str | None = None,
+        required_initial_tool_args: dict[str, Any] | None = None,
     ) -> ToolCallingAgentRunner:
         """根据 SKILL.md 创建 Agent。"""
 
@@ -451,6 +581,8 @@ class SkillAgentFactory:
             require_blackboard_progress_before_final=(
                 require_blackboard_progress_before_final
             ),
+            required_initial_tool=required_initial_tool,
+            required_initial_tool_args=required_initial_tool_args,
         )
 
 

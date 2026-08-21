@@ -1,4 +1,6 @@
 ARG NUCLEI_VERSION=v3.4.10
+ARG JADX_VERSION=1.5.6
+ARG JADX_SHA256=545ea2be9c242511bc145755cf4bda2485ade42966e096f8b4d3da2a230e8974
 
 # Pin the working PowerShell 7.5.0 filesystem. A floating stage tag can leave
 # pwsh and System.Management.Automation.dll from different upstream revisions
@@ -57,6 +59,9 @@ FROM projectdiscovery/nuclei:${NUCLEI_VERSION} AS nuclei-tool
 
 FROM debian:bookworm-slim
 
+ARG JADX_VERSION
+ARG JADX_SHA256
+
 # 先复制构建产物，让最终阶段依赖 builder 完成。这样 BuildKit 不会在
 # Go 编译占用大量内存时并行运行 apt，避免资源峰值导致 apt 异常退出。
 COPY --from=security-tools-builder /out/subfinder /usr/local/bin/subfinder
@@ -92,6 +97,7 @@ RUN rm -rf /var/lib/apt/lists/* \
         libicu72 \
         libssl3 \
         nmap \
+        openjdk-17-jre-headless \
         python3 \
         python3-pip \
         python3-venv \
@@ -99,6 +105,19 @@ RUN rm -rf /var/lib/apt/lists/* \
     && rm -rf /var/lib/apt/lists/*
 
 RUN ln -s /opt/microsoft/powershell/7/pwsh /usr/local/bin/pwsh
+
+# Install the pinned JADX CLI release and verify the digest published by
+# GitHub before exposing it to sandbox commands.
+RUN curl --fail --location --retry 5 --retry-all-errors \
+        "https://github.com/skylot/jadx/releases/download/v${JADX_VERSION}/jadx-${JADX_VERSION}.zip" \
+        --output /tmp/jadx.zip \
+    && echo "${JADX_SHA256}  /tmp/jadx.zip" | sha256sum --check --strict \
+    && mkdir -p /opt/jadx \
+    && python3 -m zipfile -e /tmp/jadx.zip /opt/jadx \
+    && rm /tmp/jadx.zip \
+    && chmod -R a=rX /opt/jadx \
+    && chmod 0755 /opt/jadx/bin/jadx \
+    && ln -s /opt/jadx/bin/jadx /usr/local/bin/jadx
 
 # 与 APT 分层，PyPI 波动时不必重新安装系统包。固定容易发生兼容问题的
 # 二进制依赖，避免未来的新版本导致 Python 3.11 运行异常。
@@ -146,6 +165,7 @@ RUN mkdir -p /opt/qinyuan/wordlists \
     && command -v nmap >/dev/null \
     && command -v curl >/dev/null \
     && command -v file >/dev/null \
+    && command -v jadx >/dev/null \
     && command -v readelf >/dev/null \
     && command -v objdump >/dev/null \
     && command -v nm >/dev/null \
@@ -176,6 +196,7 @@ USER 10001:10001
 # Validate the same non-root entrypoint used by SandboxService. This catches
 # an inconsistent copied PowerShell runtime while the image is being built.
 RUN pwsh -NoLogo -NoProfile -NonInteractive -Command \
-    '$PSVersionTable.PSVersion.ToString()' >/dev/null
+    '$PSVersionTable.PSVersion.ToString()' >/dev/null \
+    && jadx --version >/dev/null
 
 CMD ["sleep", "infinity"]

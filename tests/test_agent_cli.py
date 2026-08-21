@@ -15,6 +15,8 @@ from Agents.agent import (
     ToolCallingAgentRunner,
 )
 from agent import (
+    CHALLENGE_INVENTORY_TOOL,
+    CHALLENGE_INVENTORY_TOOL_ARGS,
     EXECUTION_SYSTEM_PROMPT,
     EXECUTION_PREFIX,
     PLANNING_PREFIX,
@@ -98,6 +100,101 @@ class AgentCliTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("There are two separate completion decisions", EXECUTION_SYSTEM_PROMPT)
         self.assertIn("goal_achieved` to false", EXECUTION_SYSTEM_PROMPT)
         self.assertIn("whole Goal", TIMEOUT_SYSTEM_PROMPT)
+        self.assertIn(CHALLENGE_INVENTORY_TOOL, EXECUTION_SYSTEM_PROMPT)
+        self.assertIn("recursively run `file`", EXECUTION_SYSTEM_PROMPT)
+        self.assertIn("skip that action", EXECUTION_SYSTEM_PROMPT)
+
+    async def test_attachment_inventory_must_complete_before_other_tools(
+        self,
+    ) -> None:
+        calls: list[str] = []
+        inventory = StructuredTool.from_function(
+            lambda script: calls.append(script) or {
+                "ok": True,
+                "status": "completed",
+                "stdout": "/challenge/task.bin: ELF 64-bit executable",
+            },
+            name=CHALLENGE_INVENTORY_TOOL,
+            description="Inventory challenge files and identify their types",
+        )
+        probe = StructuredTool.from_function(
+            lambda: calls.append("probe") or {
+                "ok": True,
+                "status": "completed",
+                "stdout": "probe complete",
+            },
+            name="probe",
+            description="Run another analysis tool",
+        )
+        expected = (
+            'BLACKBOARD_RESULT: {"facts":[{"content":"ELF inspected"}],'
+            '"edges":[],"goal_achieved":false,"final_answer":null}'
+        )
+        llm = _SequencedLLM(
+            [
+                _ToolResponse(
+                    "",
+                    [{"name": "probe", "args": {}, "id": "call-1"}],
+                ),
+                _ToolResponse(
+                    "",
+                    [
+                        {
+                            "name": CHALLENGE_INVENTORY_TOOL,
+                            "args": {"script": "pwd"},
+                            "id": "call-2",
+                        },
+                        {"name": "probe", "args": {}, "id": "call-3"},
+                    ],
+                ),
+                _ToolResponse(
+                    "",
+                    [
+                        {
+                            "name": "missing_disassembler",
+                            "args": {},
+                            "id": "call-missing",
+                        }
+                    ],
+                ),
+                _ToolResponse(
+                    "",
+                    [{"name": "probe", "args": {}, "id": "call-4"}],
+                ),
+                _Response(expected),
+            ]
+        )
+        runner = ToolCallingAgentRunner(
+            llm=llm,
+            system_prompt="execution",
+            tools=[inventory, probe],
+            max_steps=5,
+            require_tool_call_before_final=True,
+            required_initial_tool=CHALLENGE_INVENTORY_TOOL,
+            required_initial_tool_args=CHALLENGE_INVENTORY_TOOL_ARGS,
+        )
+
+        result = await runner.arun("execute with /challenge mounted")
+
+        self.assertEqual(result, expected)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("ls -la /challenge", calls[0])
+        self.assertIn("file --", calls[0])
+        self.assertEqual(calls[1], "probe")
+        self.assertTrue(
+            any(
+                "was not executed" in str(message.content)
+                for snapshot in llm.message_snapshots
+                for message in snapshot
+            )
+        )
+        self.assertTrue(
+            any(
+                "Unknown tool: missing_disassembler" in str(message.content)
+                for snapshot in llm.message_snapshots
+                for message in snapshot
+            )
+        )
 
     def test_health_check_does_not_churn_probe_containers(self) -> None:
         runtime = MagicMock()

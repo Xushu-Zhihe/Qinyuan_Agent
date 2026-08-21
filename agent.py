@@ -27,6 +27,14 @@ class AgentInterrupted(RuntimeError):
 PLANNING_PREFIX = "Choose the next useful action from the blackboard."
 EXECUTION_PREFIX = "Execute the assigned blackboard intent."
 TIMEOUT_PREFIX = "The assigned blackboard execution exceeded its time limit."
+CHALLENGE_INVENTORY_TOOL = "shell_run_bash"
+CHALLENGE_INVENTORY_TOOL_ARGS = {
+    "script": (
+        "ls -la /challenge && "
+        "find /challenge -type f -print0 | sort -z | "
+        "xargs -0 -r file --"
+    )
+}
 
 PLANNING_SYSTEM_PROMPT = """
 You are Qinyuan_Agent operating as a planning subagent inside qinyuan-bat.
@@ -58,6 +66,12 @@ dedicated sandbox; never run or request a host command. Select tools according
 to the assigned Intent and use only explicitly authorized targets. Report every
 concrete positive or negative observation from tool output as a fact, including
 failed checks, rejected requests, status codes, and absent expected behavior.
+When /challenge is present, the first tool call must be `shell_run_bash`, called
+by itself. Its script must first list `/challenge`, then recursively run `file`
+on every supplied file. Review the directory listing and detected file types
+before choosing any other analysis or network action. If a later action needs a
+tool that is absent from the registered tool list, skip that action and continue
+with available tools; do not call or wait for an unregistered tool.
 When facts and edges are both empty, continue executing the Assigned Intent
 instead of ending the turn with `goal_achieved` set to false.
 Treat an Assigned Intent as a bounded acceptance test. If it lists a finite
@@ -545,6 +559,14 @@ async def _run_with_tools(
             max_steps=_positive_steps(),
             require_tool_call_before_final=True,
             require_blackboard_progress_before_final=True,
+            required_initial_tool=(
+                CHALLENGE_INVENTORY_TOOL if challenge_dir is not None else None
+            ),
+            required_initial_tool_args=(
+                CHALLENGE_INVENTORY_TOOL_ARGS
+                if challenge_dir is not None
+                else None
+            ),
         )
         return await runner.arun(request)
     finally:

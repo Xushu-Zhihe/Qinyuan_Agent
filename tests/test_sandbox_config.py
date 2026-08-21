@@ -454,6 +454,12 @@ class SandboxConfigurationTests(unittest.TestCase):
             frozenset({"nmap", "python3", "pwsh"}),
         )
 
+    def test_default_settings_select_jadx_sandbox_image(self) -> None:
+        settings = SandboxSettings()
+
+        self.assertEqual(settings.image, "qinyuan/pentest-sandbox:0.3.3")
+        self.assertIn("jadx", settings.allowed_tools)
+
     def test_settings_pin_docker_endpoint_and_retry_policy(self) -> None:
         environment = {
             "QINYUAN_DOCKER_HOST": "npipe:////./pipe/dockerDesktopLinuxEngine",

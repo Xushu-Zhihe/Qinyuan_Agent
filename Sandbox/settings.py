@@ -10,6 +10,7 @@ DEFAULT_ALLOWED_TOOLS = frozenset(
         "bash",
         "python3",
         "file",
+        "jadx",
         "readelf",
         "objdump",
         "nm",
@@ -85,7 +86,7 @@ def _default_docker_host() -> str:
 
 @dataclass(frozen=True)
 class SandboxSettings:
-    image: str = "qinyuan/pentest-sandbox:0.3.2"
+    image: str = "qinyuan/pentest-sandbox:0.3.3"
     network: str = "qinyuan_pentest_lab"
     network_internal: bool = True
 
@@ -129,7 +130,7 @@ class SandboxSettings:
         return cls(
             image=os.environ.get(
                 "QINYUAN_SANDBOX_IMAGE",
-                "qinyuan/pentest-sandbox:0.3.2",
+                "qinyuan/pentest-sandbox:0.3.3",
             ).strip(),
             network=os.environ.get(
                 "QINYUAN_SANDBOX_NETWORK",

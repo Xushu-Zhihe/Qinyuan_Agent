@@ -21,6 +21,7 @@ def _load_module(name: str, relative_path: str):
 
 
 file_mcp = _load_module("qinyuan_test_file_mcp", "MCPs/File_Mcp/server.py")
+jadx_mcp = _load_module("qinyuan_test_jadx_mcp", "MCPs/Jadx_Mcp/server.py")
 binutils_mcp = _load_module(
     "qinyuan_test_binutils_mcp", "MCPs/Binutils_Mcp/server.py"
 )
@@ -41,6 +42,7 @@ class AnalysisMcpPlannerTests(unittest.TestCase):
         registry = load_registry(ROOT / "MCPs" / "Mcp_client" / "registry.json")
         expected = {
             "file": {"file"},
+            "jadx": {"jadx"},
             "binutils": {"readelf", "objdump", "nm", "strings"},
             "gdb": {"gdb"},
             "pwntools": {"python3"},
@@ -65,6 +67,54 @@ class AnalysisMcpPlannerTests(unittest.TestCase):
 
         nm_plan = binutils_mcp.inspect_binary("/work/sample.bin", operation="nm")
         self.assertEqual(nm_plan["sandbox_command"]["tool"], "nm")
+
+    def test_jadx_plan_decompiles_into_work_directory(self) -> None:
+        plan = jadx_mcp.decompile_android(
+            "/challenge/application.apk",
+            "/work/jadx/application",
+        )
+        command = plan["sandbox_command"]
+
+        self.assertEqual(command["tool"], "jadx")
+        self.assertEqual(
+            command["arguments"],
+            [
+                "--output-dir",
+                "/work/jadx/application",
+                "--deobf",
+                "/challenge/application.apk",
+            ],
+        )
+        self.assertEqual(command["timeout_seconds"], 300)
+
+    def test_jadx_plan_rejects_unsafe_input_and_output_paths(self) -> None:
+        invalid_cases = [
+            ("/etc/passwd", "/work/jadx-output"),
+            ("/challenge/application.apk", "/challenge/output"),
+            ("/challenge/application.apk", "/work"),
+            ("/challenge/application.apk", "/work/../challenge/output"),
+        ]
+        for input_path, output_dir in invalid_cases:
+            with self.subTest(input_path=input_path, output_dir=output_dir):
+                with self.assertRaises(ValueError):
+                    jadx_mcp.decompile_android(input_path, output_dir)
+
+        with self.assertRaisesRegex(ValueError, "must be a boolean"):
+            jadx_mcp.decompile_android(
+                "/challenge/application.apk",
+                deobfuscate="yes",
+            )
+
+    def test_docker_image_installs_pinned_jadx_release(self) -> None:
+        dockerfile = (ROOT / "Sandbox" / "dockerfile").read_text(encoding="utf-8")
+
+        self.assertIn("ARG JADX_VERSION=1.5.6", dockerfile)
+        self.assertIn(
+            "545ea2be9c242511bc145755cf4bda2485ade42966e096f8b4d3da2a230e8974",
+            dockerfile,
+        )
+        self.assertIn("openjdk-17-jre-headless", dockerfile)
+        self.assertIn("command -v jadx", dockerfile)
 
     def test_gdb_plan_is_batch_and_rejects_escape_commands(self) -> None:
         plan = gdb_mcp.debug_binary(
