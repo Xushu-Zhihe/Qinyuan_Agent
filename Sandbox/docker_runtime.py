@@ -205,6 +205,10 @@ class DockerRuntime:
                 f"size={self.settings.temporary_size},"
                 "mode=1777"
             ),
+            "/tools": (
+                "rw,exec,nosuid,nodev,"
+                "size=256m,uid=10001,gid=10001,mode=0700"
+            ),
         }
         volumes: dict[str, dict[str, str]] = {}
         working_dir = "/workspace"
@@ -247,6 +251,8 @@ class DockerRuntime:
                     working_dir=working_dir,
                     environment={
                         "HOME": "/tmp/qinyuan-home",
+                        "PATH": "/tools/bin:/opt/dirsearch/bin:/opt/microsoft/powershell/7:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                        "PYTHONPATH": "/tools/python:/opt/qinyuan/python",
                         "XDG_CACHE_HOME": "/tmp/qinyuan-cache",
                         "XDG_CONFIG_HOME": "/tmp/qinyuan-config",
                         "DOTNET_CLI_HOME": "/tmp/qinyuan-dotnet",

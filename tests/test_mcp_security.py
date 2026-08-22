@@ -154,6 +154,23 @@ class _SuccessfulSession:
         )
 
 
+class _BootstrapSession:
+    async def call_tool(self, *_args, **_kwargs):
+        plan = {
+            "sandbox_command": {
+                "tool": "python3",
+                "arguments": ["-c", "print('installed')"],
+                "timeout_seconds": 30,
+            },
+            "bootstrap": {"compensate_seconds": 300},
+        }
+        return SimpleNamespace(
+            content=[SimpleNamespace(type="text", text=json.dumps(plan))],
+            structuredContent=None,
+            isError=False,
+        )
+
+
 class _SuccessfulSandbox:
     def execute(self, agent_id, request):
         self.called = (agent_id, request)
@@ -286,6 +303,50 @@ class McpManagerTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 root.parent.rmdir()
             except OSError:
                 pass
+
+    async def test_download_bootstrap_writes_atomic_compensation_marker(self) -> None:
+        root = ROOT / ".test-work" / uuid4().hex
+        root.mkdir(parents=True)
+        marker = root / ".qinyuan-tool-bootstrap.json"
+        sandbox = _SuccessfulSandbox()
+        config = MCPServerConfig(
+            name="download",
+            sandbox_tools=frozenset({"python3"}),
+        )
+        manager = MCPManager(
+            MCPRegistryConfig({"download": config}),
+            sandbox,
+            bootstrap_marker_path=marker,
+        )
+        manager.runtimes["download"] = MCPServerRuntime(
+            config=config,
+            session=_BootstrapSession(),
+            status="ready",
+        )
+        manager.tool_index["download.install_tool"] = MCPToolMeta(
+            server_name="download",
+            tool_name="install_tool",
+            qualified_name="download.install_tool",
+            description="",
+            input_schema={},
+            tags=frozenset(),
+        )
+        try:
+            result = await manager._execute_bound_tool(
+                agent_id="agent-1",
+                qualified_name="download.install_tool",
+                arguments={"name": "jq"},
+            )
+            payload = json.loads(marker.read_text(encoding="utf-8"))
+            self.assertEqual(result.status, "completed")
+            self.assertEqual(payload["qualified_tool"], "download.install_tool")
+            self.assertEqual(payload["compensate_seconds"], 300)
+            self.assertEqual(
+                [path.name for path in root.glob("*.tmp")],
+                [],
+            )
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
 
     async def test_host_timeout_interrupts_blocked_sandbox_execution(self) -> None:
         root = ROOT / ".test-work" / uuid4().hex

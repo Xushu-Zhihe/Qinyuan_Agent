@@ -70,8 +70,12 @@ When /challenge is present, the first tool call must be `shell_run_bash`, called
 by itself. Its script must first list `/challenge`, then recursively run `file`
 on every supplied file. Review the directory listing and detected file types
 before choosing any other analysis or network action. If a later action needs a
-tool that is absent from the registered tool list, skip that action and continue
-with available tools; do not call or wait for an unregistered tool.
+tool that is absent from the registered tool list, first use
+`download_install_tool` when it is available and the source is verified. It
+installs into the current sandbox `/tools`, preferring a native artifact and
+then its pinned Python fallback. If the download tool is absent or both
+installation paths fail, skip that action and continue with available tools;
+do not call or wait for an unregistered tool.
 When facts and edges are both empty, continue executing the Assigned Intent
 instead of ending the turn with `goal_achieved` set to false.
 Treat an Assigned Intent as a bounded acceptance test. If it lists a finite
@@ -532,6 +536,11 @@ async def _run_with_tools(
             required_servers=_optional_csv_environment("QINYUAN_MCP_REQUIRED_SERVERS"),
             audit_path=(
                 mounts.work_dir / "mcp-audit.jsonl"
+                if mounts.work_dir is not None
+                else None
+            ),
+            bootstrap_marker_path=(
+                mounts.work_dir / ".qinyuan-tool-bootstrap.json"
                 if mounts.work_dir is not None
                 else None
             ),

@@ -22,6 +22,20 @@ def _load_module(name: str, relative_path: str):
 
 file_mcp = _load_module("qinyuan_test_file_mcp", "MCPs/File_Mcp/server.py")
 jadx_mcp = _load_module("qinyuan_test_jadx_mcp", "MCPs/Jadx_Mcp/server.py")
+curl_mcp = _load_module("qinyuan_test_curl_mcp", "MCPs/Curl_Mcp/server.py")
+php_mcp = _load_module("qinyuan_test_php_mcp", "MCPs/Php_Mcp/server.py")
+libc_database_mcp = _load_module(
+    "qinyuan_test_libc_database_mcp", "MCPs/Libc_Database_Mcp/server.py"
+)
+libcsearcher_mcp = _load_module(
+    "qinyuan_test_libcsearcher_mcp", "MCPs/LibcSearcher_Mcp/server.py"
+)
+libcsearcher_runtime = _load_module(
+    "qinyuan_test_libcsearcher_runtime", "MCPs/LibcSearcher_Mcp/runtime.py"
+)
+download_mcp = _load_module(
+    "qinyuan_test_download_mcp", "MCPs/Download_Mcp/server.py"
+)
 binutils_mcp = _load_module(
     "qinyuan_test_binutils_mcp", "MCPs/Binutils_Mcp/server.py"
 )
@@ -43,6 +57,11 @@ class AnalysisMcpPlannerTests(unittest.TestCase):
         expected = {
             "file": {"file"},
             "jadx": {"jadx"},
+            "curl": {"curl"},
+            "php": {"php"},
+            "download": {"python3"},
+            "libc_database": {"curl"},
+            "libcsearcher": {"python3"},
             "binutils": {"readelf", "objdump", "nm", "strings"},
             "gdb": {"gdb"},
             "pwntools": {"python3"},
@@ -105,6 +124,121 @@ class AnalysisMcpPlannerTests(unittest.TestCase):
                 deobfuscate="yes",
             )
 
+    def test_curl_plan_preserves_argv_and_rejects_invalid_arguments(self) -> None:
+        arguments = ["-fsS", "-H", "X-Test: value", "https://example.test"]
+        plan = curl_mcp.run_curl(arguments)
+        command = plan["sandbox_command"]
+        self.assertEqual(command["tool"], "curl")
+        self.assertEqual(command["arguments"], arguments)
+
+        for arguments in [[], [""], ["ok\x00bad"]]:
+            with self.subTest(arguments=arguments):
+                with self.assertRaises(ValueError):
+                    curl_mcp.run_curl(arguments)
+
+    def test_libc_database_plans_validate_offsets_and_identifiers(self) -> None:
+        find_plan = libc_database_mcp.find_libc(
+            {"puts": "0x84420", "printf": "0x61c90"}
+        )
+        self.assertEqual(find_plan["sandbox_command"]["tool"], "curl")
+        self.assertIn("https://libc.rip/api/find", find_plan["sandbox_command"]["arguments"])
+        self.assertIn(
+            '{"symbols":{"puts":"0x84420","printf":"0x61c90"}}',
+            find_plan["sandbox_command"]["arguments"],
+        )
+        dump_plan = libc_database_mcp.dump_libc("libc6_2.31-0ubuntu9.18_amd64")
+        self.assertEqual(dump_plan["sandbox_command"]["tool"], "curl")
+        self.assertIn(
+            "https://libc.rip/api/dump?id=libc6_2.31-0ubuntu9.18_amd64",
+            dump_plan["sandbox_command"]["arguments"],
+        )
+        for call in [
+            lambda: libc_database_mcp.find_libc({"puts;id": "0x10"}),
+            lambda: libc_database_mcp.find_libc({"puts": "../../etc/passwd"}),
+            lambda: libc_database_mcp.dump_libc("../secret"),
+        ]:
+            with self.assertRaises(ValueError):
+                call()
+
+    def test_libcsearcher_returns_a_local_multi_candidate_plan(self) -> None:
+        libcsearcher_runtime.INDEX_PATH = ROOT / "MCPs" / "LibcSearcher_Mcp" / "database.json"
+
+        ambiguous = libcsearcher_runtime.find_candidates({"puts": "0x7ffff7e809c0"})
+        self.assertEqual(ambiguous["source"], "local_libcsearcher")
+        self.assertTrue(ambiguous["ambiguous"])
+        self.assertGreaterEqual(ambiguous["candidate_count"], 2)
+
+        exact = libcsearcher_runtime.find_candidates(
+            {"puts": "0x84420", "printf": "0x61c90"}
+        )
+        self.assertFalse(exact["exact"])
+        self.assertTrue(exact["unique_candidate"])
+        self.assertEqual(exact["candidates"][0]["id"], "libc6_2.31-0ubuntu9.10_amd64")
+
+        no_match = libcsearcher_runtime.find_candidates({"puts": "0x123"})
+        self.assertEqual(no_match["status"], "no_match")
+
+        plan = libcsearcher_mcp.find_candidates({"puts": "0x84420"})
+        self.assertEqual(plan["sandbox_command"]["tool"], "python3")
+        compile(plan["sandbox_command"]["arguments"][1], "<libcsearcher>", "exec")
+        self.assertEqual(plan["request"]["candidate_semantics"], "multiple_candidates_possible")
+        self.assertIn("multiple possible libc versions", libcsearcher_mcp.LIBCSEARCHER_INSTRUCTIONS)
+
+        with self.assertRaises(ValueError):
+            libcsearcher_mcp.find_candidates({"puts;id": "0x123"})
+
+    def test_download_plan_is_bounded_and_generated_script_compiles(self) -> None:
+        native = download_mcp.install_tool(
+            name="jq",
+            url="https://example.test/jq",
+            sha256="a" * 64,
+            self_test_args=["--version"],
+        )
+        self.assertEqual(native["sandbox_command"]["tool"], "python3")
+        self.assertEqual(native["sandbox_command"]["timeout_seconds"], 300)
+        self.assertEqual(native["bootstrap"]["compensate_seconds"], 300)
+        compile(native["sandbox_command"]["arguments"][1], "<download-native>", "exec")
+
+        fallback = download_mcp.install_tool(
+            name="pwntools",
+            python_package="pwntools",
+            python_version="4.13.0",
+            python_module="pwn",
+        )
+        self.assertEqual(fallback["bootstrap"]["compensate_seconds"], 300)
+        self.assertIn("--only-binary=:all:", fallback["sandbox_command"]["arguments"][1])
+        compile(fallback["sandbox_command"]["arguments"][1], "<download-fallback>", "exec")
+
+        with self.assertRaises(ValueError):
+            download_mcp.install_tool(
+                name="bad",
+                python_package="pwntools",
+                python_version="4.13.0",
+                python_module="pwn;import os",
+            )
+
+    def test_php_plans_inline_code_and_sandbox_file(self) -> None:
+        inline_plan = php_mcp.run_php("echo md5('qinyuan');")
+        self.assertEqual(inline_plan["sandbox_command"]["tool"], "php")
+        self.assertEqual(
+            inline_plan["sandbox_command"]["arguments"][-2:],
+            ["-r", "echo md5('qinyuan');"],
+        )
+
+        file_plan = php_mcp.run_php_file(
+            "/challenge/solve.php",
+            ["first argument", "--flag"],
+        )
+        self.assertEqual(
+            file_plan["sandbox_command"]["arguments"][-4:],
+            ["/challenge/solve.php", "--", "first argument", "--flag"],
+        )
+
+        with self.assertRaises(ValueError):
+            php_mcp.run_php_file("/etc/passwd")
+        with self.assertRaises(ValueError):
+            php_mcp.run_php("\x00")
+
     def test_docker_image_installs_pinned_jadx_release(self) -> None:
         dockerfile = (ROOT / "Sandbox" / "dockerfile").read_text(encoding="utf-8")
 
@@ -115,6 +249,12 @@ class AnalysisMcpPlannerTests(unittest.TestCase):
         )
         self.assertIn("openjdk-17-jre-headless", dockerfile)
         self.assertIn("command -v jadx", dockerfile)
+        self.assertNotIn("./get ubuntu", dockerfile)
+        self.assertIn("php-cli", dockerfile)
+        self.assertIn("command -v php", dockerfile)
+        self.assertIn("MCPs/LibcSearcher_Mcp/runtime.py", dockerfile)
+        self.assertIn("qinyuan_libcsearcher_index.json", dockerfile)
+        self.assertIn("qinyuan_libcsearcher.find_candidates", dockerfile)
 
     def test_gdb_plan_is_batch_and_rejects_escape_commands(self) -> None:
         plan = gdb_mcp.debug_binary(

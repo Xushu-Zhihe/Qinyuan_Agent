@@ -20,6 +20,16 @@ Android inputs can be decompiled with the registered `jadx.decompile_android`
 MCP tool. It runs the pinned JADX CLI inside the sandbox and writes output only
 to a `/work` subdirectory.
 
+When Pwn/ELF analysis needs libc matching, the Agent can call the registered
+`libcsearcher` MCP. It uses a small offline symbol-offset index in the sandbox
+and may return multiple candidate libc versions; a result is not guaranteed to
+be exact. If the challenge supplies a libc file under `/challenge`, that file
+is authoritative and should be inspected first. The existing `libc_database`
+MCP remains the online fallback through the sandbox's `curl` binary and the
+fixed `https://libc.rip` API. Neither MCP bundles the full Ubuntu libc package
+corpus into the image. The bundled index targets common amd64 glibc releases;
+other architectures or versions fall back to the online MCP.
+
 For project-owned sandboxes, qinyuan-bat also supplies
 `--sandbox-owner-id <stable-owner>` and `--sandbox-work-dir <stable-workspace>`.
 Those short-lived provider processes detach without deleting the sandbox. The
@@ -44,6 +54,17 @@ with `QINYUAN_DOCKER_CONTROL_TIMEOUT_SECONDS` and
 `QINYUAN_DOCKER_API_TIMEOUT_SECONDS`. `qinyuan-agent --health` checks Docker,
 the sandbox image, and MCP resources without creating a disposable container.
 
+When an execution needs a tool that is not in the image, the `download` MCP
+can install a verified HTTPS artifact or a pinned Python wheel into the
+current sandbox `/tools`. It never writes to the host and does not start a
+separate bootstrap process. Configure its command limit with
+`QINYUAN_TOOL_BOOTSTRAP_TIMEOUT_SECONDS=300`. A download emits one controlled
+bootstrap marker; qinyuan-bat consumes it once and adds
+`QINYUAN_TOOL_BOOTSTRAP_BUDGET_SECONDS=300` to the local solver deadline. This
+does not pause or extend the platform's own task TTL, and the normal task
+timeout remains `3600` seconds. If the budget is changed from `300`, expose
+the same variable to the qinyuan-bat process as well as qinyuan-agent.
+
 `-I` 会从当前工作目录之外验证已安装包，避免源码目录碰巧可见而掩盖缺失的运行包或资源。`qinyuan-agent --health` 也会加载 Execution 所需模块，并检查启用的 MCP server 目录。
 
 安装对应沙盒并且验证：
@@ -54,7 +75,7 @@ docker build `
   --provenance=false `
   --sbom=false `
   --file Sandbox/dockerfile `
-  --tag qinyuan/pentest-sandbox:0.3.3 `
+  --tag qinyuan/pentest-sandbox:0.3.4 `
   .
 qinyuan-agent --health
 ```

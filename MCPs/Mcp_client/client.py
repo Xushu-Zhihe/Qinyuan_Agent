@@ -242,6 +242,7 @@ class MCPManager:
         sandbox_interrupt_timeout_seconds: float = 10.0,
         output_character_limit: int = 20_000,
         audit_path: str | Path | None = None,
+        bootstrap_marker_path: str | Path | None = None,
         required_servers: Iterable[str] | None = None,
     ) -> None:
         if mcp_call_timeout_seconds <= 0:
@@ -267,6 +268,11 @@ class MCPManager:
         self.sandbox_interrupt_timeout_seconds = sandbox_interrupt_timeout_seconds
         self.output_character_limit = output_character_limit
         self.audit_path = Path(audit_path).resolve() if audit_path is not None else None
+        self.bootstrap_marker_path = (
+            Path(bootstrap_marker_path).resolve()
+            if bootstrap_marker_path is not None
+            else None
+        )
 
         requested_required = frozenset(
             item.strip() for item in (required_servers or ()) if item.strip()
@@ -582,7 +588,12 @@ class MCPManager:
                 "a command plan in time"
             ) from exc
 
-        request = self._extract_command_request(mcp_result)
+        request, bootstrap_seconds = self._extract_command_plan(mcp_result)
+
+        if bootstrap_seconds and meta.server_name != "download":
+            raise MCPCommandPlanError(
+                "only the download MCP server may request tool bootstrap compensation"
+            )
 
         if request.tool not in runtime.config.sandbox_tools:
             raise MCPCommandPlanError(
@@ -598,6 +609,11 @@ class MCPManager:
             "arguments": list(request.arguments),
             "timeout_seconds": request.timeout_seconds,
         }
+        if bootstrap_seconds:
+            self._write_bootstrap_marker(
+                qualified_name=qualified_name,
+                compensate_seconds=bootstrap_seconds,
+            )
         await self._write_audit({"event": "started", **audit_base})
         execution_task = asyncio.create_task(
             asyncio.to_thread(
@@ -785,7 +801,7 @@ class MCPManager:
 
         return future.result()
 
-    def _extract_command_request(self,result: Any) -> CommandRequest:
+    def _extract_command_plan(self, result: Any) -> tuple[CommandRequest, int]:
         text_blocks = [
             block.text
             for block in (getattr(result,"content",None) or [])
@@ -814,17 +830,67 @@ class MCPManager:
 
         for candidate in candidates:
             plan = candidate.get("sandbox_command")
+            bootstrap = candidate.get("bootstrap")
 
             # 兼容某些 MCP SDK将函数结果包装在 result字段中的情况
             if plan is None and isinstance(candidate.get("result"), dict):
-                plan = candidate["result"].get("sandbox_command")
+                nested = candidate["result"]
+                plan = nested.get("sandbox_command")
+                if bootstrap is None:
+                    bootstrap = nested.get("bootstrap")
 
             if isinstance(plan, dict):
-                return self._validate_command_plan(plan)
+                compensate_seconds = self._validate_bootstrap(bootstrap)
+                return self._validate_command_plan(plan), compensate_seconds
 
         raise MCPCommandPlanError(
             "MCP Server did not return a sandbox_command object"
         )
+
+    def _extract_command_request(self, result: Any) -> CommandRequest:
+        """Compatibility wrapper for callers that only need the command."""
+        request, _ = self._extract_command_plan(result)
+        return request
+
+    @staticmethod
+    def _validate_bootstrap(value: Any) -> int:
+        if value is None:
+            return 0
+        if not isinstance(value, dict) or set(value) != {"compensate_seconds"}:
+            raise MCPCommandPlanError(
+                "bootstrap must contain only compensate_seconds"
+            )
+        seconds = value.get("compensate_seconds")
+        if isinstance(seconds, bool) or seconds != 300:
+            raise MCPCommandPlanError(
+                "bootstrap.compensate_seconds must be exactly 300"
+            )
+        return 300
+
+    def _write_bootstrap_marker(
+        self,
+        *,
+        qualified_name: str,
+        compensate_seconds: int,
+    ) -> None:
+        if self.bootstrap_marker_path is None:
+            return
+        target = self.bootstrap_marker_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(
+            f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        payload = {
+            "version": 1,
+            "qualified_tool": qualified_name,
+            "compensate_seconds": compensate_seconds,
+            "started_at": time.time(),
+        }
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        temporary.replace(target)
 
     @staticmethod
     def _validate_command_plan(plan:dict[str,Any]) -> CommandRequest:
@@ -944,6 +1010,7 @@ async def build_mcp_runtime(
     allowed_servers: Iterable[str] | None = None,
     required_servers: Iterable[str] | None = None,
     audit_path: str | Path | None = None,
+    bootstrap_marker_path: str | Path | None = None,
 ) -> MCPManager:
     if registry_path is None:
         registry_path = Path(__file__).with_name("registry.json")
@@ -974,6 +1041,7 @@ async def build_mcp_runtime(
         ),
         required_servers=required_servers,
         audit_path=audit_path,
+        bootstrap_marker_path=bootstrap_marker_path,
     )
 
     await manager.start_all()

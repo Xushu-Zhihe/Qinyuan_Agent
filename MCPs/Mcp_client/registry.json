@@ -95,6 +95,51 @@
       "sandboxTools": ["bash", "pwsh"],
       "enabled": true
     },
+    "curl": {
+      "transport": "stdio",
+      "command": "{python}",
+      "cwd": "../Curl_Mcp",
+      "args": ["server.py"],
+      "tags": ["web", "http", "network"],
+      "sandboxTools": ["curl"],
+      "enabled": true
+    },
+    "php": {
+      "transport": "stdio",
+      "command": "{python}",
+      "cwd": "../Php_Mcp",
+      "args": ["server.py"],
+      "tags": ["web", "php", "scripting"],
+      "sandboxTools": ["php"],
+      "enabled": true
+    },
+    "download": {
+      "transport": "stdio",
+      "command": "{python}",
+      "cwd": "../Download_Mcp",
+      "args": ["server.py"],
+      "tags": ["tooling", "download", "python"],
+      "sandboxTools": ["python3"],
+      "enabled": true
+    },
+    "libc_database": {
+      "transport": "stdio",
+      "command": "{python}",
+      "cwd": "../Libc_Database_Mcp",
+      "args": ["server.py"],
+      "tags": ["pwn", "binary-exploitation", "libc"],
+      "sandboxTools": ["curl"],
+      "enabled": true
+    },
+    "libcsearcher": {
+      "transport": "stdio",
+      "command": "{python}",
+      "cwd": "../LibcSearcher_Mcp",
+      "args": ["server.py"],
+      "tags": ["pwn", "binary-exploitation", "libc", "local-database"],
+      "sandboxTools": ["python3"],
+      "enabled": true
+    },
     "file": {
       "transport": "stdio",
       "command": "{python}",

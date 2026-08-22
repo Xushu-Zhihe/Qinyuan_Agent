@@ -326,7 +326,8 @@ class DockerRuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
                         "-c",
                         "import shutil,sys; "
                         "tools=['bash','nmap','curl','subfinder','amass','httpx',"
-                        "'ffuf','dirsearch','nuclei','pwsh','jadx']; "
+                        "'ffuf','dirsearch','nuclei','pwsh','jadx','php',"
+                        "]; "
                         "missing=[tool for tool in tools if not shutil.which(tool)]; "
                         "print(','.join(missing)); sys.exit(bool(missing))",
                     ),

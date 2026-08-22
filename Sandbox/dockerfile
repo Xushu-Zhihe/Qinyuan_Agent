@@ -56,7 +56,6 @@ RUN git clone --depth 1 \
 # 直接复用 ProjectDiscovery 官方镜像中的固定版本二进制。
 FROM projectdiscovery/nuclei:${NUCLEI_VERSION} AS nuclei-tool
 
-
 FROM debian:bookworm-slim
 
 ARG JADX_VERSION
@@ -98,6 +97,8 @@ RUN rm -rf /var/lib/apt/lists/* \
         libssl3 \
         nmap \
         openjdk-17-jre-headless \
+        perl \
+        php-cli \
         python3 \
         python3-pip \
         python3-venv \
@@ -145,6 +146,12 @@ RUN mkdir -p /opt/qinyuan/python \
         "z3-solver==4.15.1.0" \
         "pycryptodome==3.23.0"
 
+# Keep a small, offline LibcSearcher-compatible matcher and its verified
+# symbol-offset index in the read-only analysis library path. This is metadata
+# only; the image does not contain the Ubuntu libc package corpus.
+COPY MCPs/LibcSearcher_Mcp/runtime.py /opt/qinyuan/python/qinyuan_libcsearcher.py
+COPY MCPs/LibcSearcher_Mcp/database.json /opt/qinyuan/python/qinyuan_libcsearcher_index.json
+
 # 内置小型字典用于开发和集成测试；生产环境可在后续镜像版本中替换。
 RUN mkdir -p /opt/qinyuan/wordlists \
     && printf '%s\n' \
@@ -164,6 +171,7 @@ RUN mkdir -p /opt/qinyuan/wordlists \
         /usr/local/bin/nuclei /usr/local/bin/ffuf /usr/local/bin/amass \
     && command -v nmap >/dev/null \
     && command -v curl >/dev/null \
+    && command -v php >/dev/null \
     && command -v file >/dev/null \
     && command -v jadx >/dev/null \
     && command -v readelf >/dev/null \
@@ -178,7 +186,8 @@ RUN mkdir -p /opt/qinyuan/wordlists \
     && command -v dirsearch >/dev/null \
     && command -v nuclei >/dev/null \
     && command -v pwsh >/dev/null \
-    && /usr/bin/python3 -c "import Crypto, pwn, z3"
+    && php -r 'exit(PHP_VERSION_ID >= 80200 ? 0 : 1);' \
+    && /usr/bin/python3 -c "import Crypto, pwn, z3, qinyuan_libcsearcher; assert qinyuan_libcsearcher.find_candidates({'puts': '0x80ed0'})['candidate_count'] >= 1"
 
 RUN groupadd --gid 10001 sandbox \
     && useradd \
