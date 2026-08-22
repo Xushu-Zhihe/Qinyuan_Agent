@@ -9,7 +9,9 @@ Finish with exactly one single-line `BLACKBOARD_RESULT: ` record followed by str
 
 Set `protocol_version` to `2`. Facts use `{"ref":"unique-ref","content":"non-empty fact"}`. Edges use `{"type":"addresses","from":"node-or-ref","to":"node-or-ref"}` and may use `supports`, `contradicts`, `derived_from`, `addresses`, `similar_to`, or `equivalent_to`.
 
-When the Goal is achieved, `goal_result_ref` identifies one self-contained Fact that fully answers the current Goal. That Fact must directly `addresses` the current Goal, either through an existing graph edge or an edge in this result. Evidence Facts may support it but must not be selected as the result. When the Goal is not achieved, set `goal_result_ref` to `null`.
+Return at most 4 new Facts. Record only new, explicitly verified, durable information. Omit reasoning, repeated background, command transcripts, plans, and environment or provider diagnostics. Ordinary evidence Facts are limited to 800 characters each. The Goal result Fact is limited to 4000 characters. All new Fact content is limited to 6000 characters total.
+
+When the Goal is achieved, `goal_result_ref` identifies one self-contained but concise Fact that fully answers the current Goal. Include only information needed by downstream submission. That Fact must directly `addresses` the current Goal, either through an existing graph edge or an edge in this result. Evidence Facts may support it but must not be selected as the result. When the Goal is not achieved, set `goal_result_ref` to `null`.
 
 Before emitting the line, run:
 
@@ -23,6 +25,6 @@ BLACKBOARD_RESULT: {"protocol_version":2,"intent_id":"intent-2","facts":[{"ref":
 BLACKBOARD_RESULT: {"protocol_version":2,"intent_id":"intent-3","facts":[{"ref":"result","content":"Final report"},{"ref":"evidence","content":"Verified observation"}],"edges":[{"type":"addresses","from":"result","to":"goal-1"},{"type":"supports","from":"evidence","to":"result"}],"goal_achieved":true,"goal_result_ref":"result"}
 ```
 
-Do not shorten the result to a flag or answer key. Do not wrap the protocol line in a Markdown fence.
+Do not omit information required to submit or verify the answer. Do not wrap the protocol line in a Markdown fence.
 
 Validation failures use the same precise parser vocabulary, including `fact proposal must be an object`, `unknown node reference`, and rejection of Python `key=value` syntax.
