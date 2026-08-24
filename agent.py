@@ -168,7 +168,7 @@ def classify_request(request: str) -> RequestMode:
 
 
 def _positive_steps() -> int:
-    raw = os.environ.get("QINYUAN_MAX_STEPS", "60")
+    raw = os.environ.get("QINYUAN_MAX_STEPS", "300")
     try:
         value = int(raw)
     except ValueError as exc:
@@ -318,7 +318,7 @@ def _build_llm() -> Any:
     backend = os.environ.get("QINYUAN_LLM_BACKEND", "kimi").strip().lower()
     model = os.environ.get("QINYUAN_MODEL", "moonshot-v1-8k").strip()
     timeout = _positive_float_environment("QINYUAN_LLM_TIMEOUT_SECONDS", 180.0)
-    max_retries = _nonnegative_int_environment("QINYUAN_LLM_MAX_RETRIES", 1)
+    max_retries = _nonnegative_int_environment("QINYUAN_LLM_MAX_RETRIES", 3)
 
     if backend == "kimi":
         from LLMs.kimi_adapter import get_kimi_llm
